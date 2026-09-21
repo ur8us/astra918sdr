@@ -1,0 +1,5 @@
+[toolchain]
+channel = "1.90.0"
+components = ["rustfmt", "clippy"]
+targets = ["thumbv8m.main-none-eabihf"]
+profile = "minimal"
