@@ -300,6 +300,7 @@ impl Receiver {
         match command {
             Command::Frequency(None) => Reply::frequency(t),
             Command::Mode(None) => Reply::mode(t),
+            Command::FilterWidth => Reply::filter_width(self.settings.high - self.settings.low),
             Command::If => Reply::information(t),
             Command::Id => Reply::literal(b"ID020;"),
             Command::Ai => Reply::literal(b"AI0;"),

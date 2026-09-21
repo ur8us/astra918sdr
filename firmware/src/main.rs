@@ -63,8 +63,9 @@ enum Engine {
     Run(Receiver),
     Update(Receiver),
 }
-static ENGINE: Channel<CriticalSectionRawMutex, Engine, 1> = Channel::new();
-static ENGINE_ACK: Channel<CriticalSectionRawMutex, Result<(), Error>, 1> = Channel::new();
+static ENGINE: Channel<CriticalSectionRawMutex, (u32, Engine), 1> = Channel::new();
+static ENGINE_ACK: Channel<CriticalSectionRawMutex, (u32, Result<(), Error>), 1> = Channel::new();
+static ENGINE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static BLOCKS: Channel<CriticalSectionRawMutex, ([u8; a::IQ_FRAME], u32), 8> = Channel::new();
 static AUDIO: Mutex<CriticalSectionRawMutex, RefCell<AudioQueue>> =
     Mutex::new(RefCell::new(AudioQueue::new()));
@@ -270,7 +271,7 @@ async fn engine_task(mut capture: capture::Capture) {
     let mut settling = 12_000usize;
     loop {
         match select(ENGINE.receive(), Timer::after_micros(250)).await {
-            Either::First(command) => {
+            Either::First((ticket, command)) => {
                 let result = match command {
                     Engine::Pause => {
                         running = false;
@@ -298,7 +299,7 @@ async fn engine_task(mut capture: capture::Capture) {
                         Ok(())
                     }
                 };
-                ENGINE_ACK.send(result).await;
+                ENGINE_ACK.send((ticket, result)).await;
             }
             Either::Second(()) => {}
         }
@@ -352,10 +353,21 @@ async fn engine_task(mut capture: capture::Capture) {
     }
 }
 async fn engine(command: Engine) -> Result<(), Error> {
-    ENGINE.send(command).await;
-    with_timeout(Duration::from_millis(500), ENGINE_ACK.receive())
-        .await
-        .map_err(|_| Error::Timeout)?
+    let sequence = ENGINE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    with_timeout(Duration::from_millis(500), async {
+        // A late acknowledgement from a timed-out operation cannot confirm a
+        // different operation. Drain it before queuing the next request.
+        while ENGINE_ACK.try_receive().is_ok() {}
+        ENGINE.send((sequence, command)).await;
+        loop {
+            let (ack, result) = ENGINE_ACK.receive().await;
+            if ack == sequence {
+                return result;
+            }
+        }
+    })
+    .await
+    .map_err(|_| Error::Timeout)?
 }
 async fn apply(
     r: &mut Receiver,
@@ -367,6 +379,7 @@ async fn apply(
 ) -> Result<(), Error> {
     match action {
         Action::Configure | Action::Retry => {
+            r.configured = false;
             engine(Engine::Pause).await?;
             while BLOCKS.try_receive().is_ok() {}
             let configured = with_timeout(
@@ -375,10 +388,7 @@ async fn apply(
             )
             .await
             .map_err(|_| Error::Timeout)?;
-            if let Err(e) = configured {
-                r.fault(e as u32);
-                return Err(e);
-            }
+            configured?;
             with_timeout(Duration::from_millis(100), chip.mute(false))
                 .await
                 .map_err(|_| Error::Timeout)??;
@@ -572,7 +582,12 @@ async fn main(spawner: Spawner) {
                         {
                             Ok(()) => a::Status::Ok,
                             Err(e) => {
-                                if matches!(action, Action::Configure | Action::Retry) {
+                                if matches!(
+                                    action,
+                                    Action::Configure | Action::Retry | Action::Capacitor
+                                ) {
+                                    let _ = engine(Engine::Pause).await;
+                                    READY.store(false, Ordering::Release);
                                     radio.fault(e as u32);
                                 }
                                 a::Status::Io
@@ -587,7 +602,20 @@ async fn main(spawner: Spawner) {
                     Err(_) => Err(Error::Protocol),
                     Ok(None) => Ok(()),
                     Ok(Some((s, action))) => {
-                        apply(&mut radio, s, action, &mut chip, &mut flash, &mut save_seq).await
+                        let result =
+                            apply(&mut radio, s, action, &mut chip, &mut flash, &mut save_seq)
+                                .await;
+                        if let Err(error) = result {
+                            if matches!(
+                                action,
+                                Action::Configure | Action::Retry | Action::Capacitor
+                            ) {
+                                let _ = engine(Engine::Pause).await;
+                                READY.store(false, Ordering::Release);
+                                radio.fault(error as u32);
+                            }
+                        }
+                        result
                     }
                 };
                 CAT_REPLIES

@@ -45,6 +45,7 @@ impl Tuning {
 pub enum Command {
     Frequency(Option<u32>),
     Mode(Option<Mode>),
+    FilterWidth,
     If,
     Id,
     Ai,
@@ -58,6 +59,7 @@ pub fn parse(bytes: &[u8]) -> Result<Command, Error> {
     match bytes {
         b"FA" => Ok(Command::Frequency(None)),
         b"MD" => Ok(Command::Mode(None)),
+        b"FW" => Ok(Command::FilterWidth),
         b"MD1" => Ok(Command::Mode(Some(Mode::Lsb))),
         b"MD2" => Ok(Command::Mode(Some(Mode::Usb))),
         b"IF" => Ok(Command::If),
@@ -158,6 +160,11 @@ impl Reply {
     pub fn mode(tuning: Tuning) -> Self {
         let mut r = Self::literal(b"MD0;");
         r.bytes[2] = tuning.mode.digit();
+        r
+    }
+    pub fn filter_width(width: u16) -> Self {
+        let mut r = Self::literal(b"FW0000;");
+        r.decimal(2, 4, u32::from(width));
         r
     }
     pub fn information(tuning: Tuning) -> Self {

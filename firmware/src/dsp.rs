@@ -145,11 +145,10 @@ mod tests {
             if let (_, Some(v)) = d.process(
                 (12_000. * libm::cos(p)) as i16,
                 (12_000. * libm::sin(p)) as i16,
-            ) {
-                if n > 12_000 {
-                    e += f64::from(v).powi(2);
-                    count += 1;
-                }
+            ) && n > 12_000
+            {
+                e += f64::from(v).powi(2);
+                count += 1;
             }
         }
         libm::sqrt(e / count as f64)

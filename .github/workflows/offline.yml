@@ -1,0 +1,28 @@
+name: Offline firmware and host
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  host:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - run: cargo test --locked --workspace
+      - run: cargo build --locked --release -p astra918-host
+  firmware:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        variant: [rp235xa, rp235xb]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: thumbv8m.main-none-eabihf
+      - run: cargo build --locked --release -p astra918-firmware --bin astra918 --target thumbv8m.main-none-eabihf --features device,${{ matrix.variant }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.variant }}-elf
+          path: target/thumbv8m.main-none-eabihf/release/astra918

@@ -18,6 +18,7 @@ pub enum Wire {
 pub struct Client {
     wire: Wire,
     sequence: u32,
+    usable: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Device {
@@ -33,13 +34,13 @@ pub fn devices() -> Result<Vec<Device>> {
         if desc.vendor_id() != a::VID || desc.product_id() != a::PID {
             continue;
         }
-        if let Ok(handle) = dev.open() {
-            if let Ok(serial) = handle.read_serial_number_string_ascii(&desc) {
-                out.push(Device {
-                    label: format!("Astra918 {serial}"),
-                    serial,
-                });
-            }
+        if let Ok(handle) = dev.open()
+            && let Ok(serial) = handle.read_serial_number_string_ascii(&desc)
+        {
+            out.push(Device {
+                label: format!("Astra918 {serial}"),
+                serial,
+            });
         }
     }
     Ok(out)
@@ -52,6 +53,7 @@ impl Client {
         Ok(Self {
             wire: Wire::Tcp(wire),
             sequence: 0,
+            usable: true,
         })
     }
     pub fn usb(serial: &str) -> Result<Self> {
@@ -76,11 +78,15 @@ impl Client {
             return Ok(Self {
                 wire: Wire::Usb(handle),
                 sequence: 0,
+                usable: true,
             });
         }
         bail!("Receiver serial not found")
     }
     pub fn command(&mut self, cmd: u8, p: &[u8]) -> Result<Vec<u8>> {
+        ensure!(self.usable, "Transport lost framing; reconnect");
+        ensure!(p.len() <= 240, "Command payload too large");
+        self.usable = false;
         self.sequence = self.sequence.wrapping_add(1);
         let raw = a::request(cmd, self.sequence, p);
         let mut out = [0; 256];
@@ -93,6 +99,10 @@ impl Client {
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut used = 0;
                 while used < 256 {
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "USB write deadline expired"
+                    );
                     let n = s.write_bulk(
                         a::COMMAND_EP,
                         &raw[used..],
@@ -103,6 +113,10 @@ impl Client {
                 }
                 used = 0;
                 while used < 256 {
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "USB read deadline expired"
+                    );
                     let n = s.read_bulk(
                         a::REPLY_EP,
                         &mut out[used..],
@@ -123,6 +137,7 @@ impl Client {
         let status = out[6];
         out[6] = 0;
         let (_, payload) = a::parse(&out).map_err(|e| anyhow::anyhow!("Malformed reply: {e:?}"))?;
+        self.usable = true;
         ensure!(status == 0, "Receiver rejected command: status {status}");
         Ok(payload.to_vec())
     }

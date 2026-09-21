@@ -32,6 +32,9 @@ struct Args {
     /// Optional mono 12 kHz signed PCM16 WAV, looped as USB-sideband modulation.
     #[arg(long)]
     audio_wav: Option<PathBuf>,
+    /// Align a test WAV's repeating period to UTC for live WSJT-X reception.
+    #[arg(long)]
+    utc_align: bool,
 }
 struct Shared {
     radio: Receiver,
@@ -197,12 +200,25 @@ fn produce(
     iq: SyncSender<Vec<u8>>,
     audio: SyncSender<Vec<u8>>,
     wave: Option<Vec<i16>>,
+    utc_align: bool,
 ) {
     let mut previous = state.lock().unwrap().radio;
     let mut dsp = Demodulator::new(previous.settings);
     let mut sample = 0u64;
     let mut seq = 0u32;
     let mut started = Instant::now();
+    let utc_sample = || {
+        if utc_align {
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64()
+                * 12000.) as u64
+        } else {
+            0
+        }
+    };
+    let mut wave_origin = utc_sample();
     loop {
         let (r, stall) = {
             let s = state.lock().unwrap();
@@ -213,6 +229,7 @@ fn produce(
             sample = 0;
             seq = 0;
             started = Instant::now();
+            wave_origin = utc_sample();
             previous = r;
         }
         let mut frame = Vec::with_capacity(a::IQ_FRAME);
@@ -224,7 +241,7 @@ fn produce(
             let (i, q) = if let Some(wave) = &wave {
                 // A real waveform shifted to the carrier contains symmetric sidebands;
                 // the firmware's complex SSB filter selects the requested one.
-                let v = f64::from(wave[((n / 10) as usize) % wave.len()]);
+                let v = f64::from(wave[((wave_origin + n / 10) % wave.len() as u64) as usize]);
                 let phase = std::f64::consts::TAU * beat * n as f64 / 120_000.;
                 ((v * phase.cos()) as i16, (v * phase.sin()) as i16)
             } else {
@@ -289,16 +306,13 @@ fn main() -> Result<()> {
     let mut radio = Receiver::default();
     let mut saved = None;
     for slot in 0..2 {
-        if let Ok(bytes) = fs::read(args.settings.join(format!("slot{slot}.bin"))) {
-            if bytes.len() == 512 {
-                if let Some((settings, seq)) =
-                    nv::decode(bytes[..256].try_into()?, bytes[256..].try_into()?)
-                {
-                    if saved.is_none_or(|(_, old)| nv::newer(seq, old)) {
-                        saved = Some((settings, seq));
-                    }
-                }
-            }
+        if let Ok(bytes) = fs::read(args.settings.join(format!("slot{slot}.bin")))
+            && bytes.len() == 512
+            && let Some((settings, seq)) =
+                nv::decode(bytes[..256].try_into()?, bytes[256..].try_into()?)
+            && saved.is_none_or(|(_, old)| nv::newer(seq, old))
+        {
+            saved = Some((settings, seq));
         }
     }
     if let Some((settings, _)) = saved {
@@ -339,7 +353,7 @@ fn main() -> Result<()> {
     }
     let wave = args.audio_wav.as_ref().map(wav).transpose()?;
     let producer_state = state.clone();
-    thread::spawn(move || produce(producer_state, iq_tx, audio_tx, wave));
+    thread::spawn(move || produce(producer_state, iq_tx, audio_tx, wave, args.utc_align));
     println!(
         "Astra918 simulator: control {}, I/Q {}, CAT {}, PCM {} (loopback only)",
         args.port,

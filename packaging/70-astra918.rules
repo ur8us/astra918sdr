@@ -1,0 +1,2 @@
+# Astra918 development identity. Local desktop user may open its vendor interface.
+SUBSYSTEM=="usb", ATTR{idVendor}=="c0de", ATTR{idProduct}=="091a", TAG+="uaccess"
