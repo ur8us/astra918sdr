@@ -13,10 +13,12 @@ astra918sdr-sdrpp/    portable C++ library and SDR++ source module
 astra918sdr-gui/      Rust light-theme controls/status GUI
 ```
 
-The current milestone is **offline software validation**. Neither UF2 variant
-has been flashed or hardware-qualified. See [validation](docs/VALIDATION.md)
-for evidence and the later receiver checks. No frequency-generator tests are
-part of this project’s acceptance procedure.
+The current milestone is **Linux hardware bring-up**. The RP2350A image has
+been flashed and on-air FT8 decoding verified; simultaneous I/Q endurance and
+the remaining hardware checks are still in progress. See the
+[hardware record](docs/HARDWARE-2026-09-24.md) and
+[offline validation](docs/VALIDATION.md). No frequency-generator tests are
+part of this project's acceptance procedure.
 
 ## Tuning
 
@@ -89,9 +91,9 @@ Each creates `artifacts/<variant>/astra918.{elf,uf2}` and a manifest recording
 hashes, source revision and whether the tree was dirty. These commands only
 build files. The board configuration assumes a 12 MHz MCU crystal and 4 MiB
 flash, reserving the final 8 KiB for settings. Confirm the board variant,
-flash capacity and inherited pinout before the later hardware session.
+flash capacity and inherited pinout before programming a different board.
 
-## WSJT-X with the receiver (later hardware session)
+## WSJT-X with the receiver
 
 Select **Kenwood TS-480**, its CDC serial port, 115200 baud, no handshake,
 PTT VOX, Split None, Poll 1 s, and Mode None (preserves the firmware mode chosen
@@ -101,7 +103,8 @@ this is a receive-only device. Select a band in WSJT-X normally.
 Use the OS audio mixer/device so WSJT-X’s 48 kHz capture request is resampled
 from the receiver’s 12 kHz UAC1 stream. On Linux use the PipeWire/PulseAudio
 source, rather than an ALSA `hw:` device that cannot resample. This physical
-path still needs verification on each OS. CAT setters acknowledge successful
+path has been verified on Linux; native Windows/macOS checks remain pending.
+CAT setters acknowledge successful
 application; queries report applied settings, and external changes appear on
 the next poll. `FW;` reports the current audio passband width for Hamlib.
 

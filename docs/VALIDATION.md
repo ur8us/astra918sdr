@@ -1,5 +1,7 @@
 # Offline validation — 2026-09-21
 
+For the subsequent receiver bring-up, see the [September 24 hardware record](HARDWARE-2026-09-24.md).
+
 All reference repositories remained unchanged. Testing used loopback TCP,
 new PTYs and synthetic digital-mode sample files; no receiver, probe, RF
 generator or transmitter was accessed. This is a software acceptance record,
