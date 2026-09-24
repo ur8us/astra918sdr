@@ -42,11 +42,14 @@ fn sinc(x: f32) -> f32 {
 pub struct Demodulator {
     fine: Nco,
     channel: Nco,
-    dec_history: [(f32, f32); DEC_TAPS],
+    // Mirrored rings make each convolution contiguous, without a wrap branch
+    // per tap. The real filter is symmetric; the complex filter is conjugate
+    // symmetric, so pairs require half as many multiplications.
+    dec_history: [(f32, f32); DEC_TAPS * 2],
     dec_coeff: [f32; DEC_TAPS],
     dec_head: usize,
     dec_phase: usize,
-    ssb_history: [(f32, f32); SSB_TAPS],
+    ssb_history: [(f32, f32); SSB_TAPS * 2],
     ssb_coeff: [(f32, f32); SSB_TAPS],
     ssb_head: usize,
     ssb_phase: bool,
@@ -57,11 +60,11 @@ impl Demodulator {
         let mut s = Self {
             fine: Nco::new(settings.center() - i64::from(settings.hardware().frequency)),
             channel: Nco::new(i64::from(settings.offset)),
-            dec_history: [(0., 0.); DEC_TAPS],
+            dec_history: [(0., 0.); DEC_TAPS * 2],
             dec_coeff: [0.; DEC_TAPS],
             dec_head: 0,
             dec_phase: 0,
-            ssb_history: [(0., 0.); SSB_TAPS],
+            ssb_history: [(0., 0.); SSB_TAPS * 2],
             ssb_coeff: [(0., 0.); SSB_TAPS],
             ssb_head: 0,
             ssb_phase: false,
@@ -100,6 +103,7 @@ impl Demodulator {
         let wide = (self.sample(i), self.sample(q));
         let channel = self.channel.rotate(i, q);
         self.dec_history[self.dec_head] = channel;
+        self.dec_history[self.dec_head + DEC_TAPS] = channel;
         let newest = self.dec_head;
         self.dec_head = (self.dec_head + 1) % DEC_TAPS;
         self.dec_phase += 1;
@@ -108,14 +112,19 @@ impl Demodulator {
         }
         self.dec_phase = 0;
         let (mut di, mut dq) = (0., 0.);
-        let mut idx = newest;
-        for c in self.dec_coeff {
-            let (i, q) = self.dec_history[idx];
-            di += c * i;
-            dq += c * q;
-            idx = if idx == 0 { DEC_TAPS - 1 } else { idx - 1 };
+        let history = &self.dec_history[newest + 1..newest + 1 + DEC_TAPS];
+        for ((&c, &(i1, q1)), &(i2, q2)) in self.dec_coeff[..DEC_TAPS / 2]
+            .iter()
+            .zip(history.iter().rev())
+            .zip(history.iter())
+        {
+            di += c * (i1 + i2);
+            dq += c * (q1 + q2);
         }
+        di += self.dec_coeff[DEC_TAPS / 2] * history[DEC_TAPS / 2].0;
+        dq += self.dec_coeff[DEC_TAPS / 2] * history[DEC_TAPS / 2].1;
         self.ssb_history[self.ssb_head] = (di, dq);
+        self.ssb_history[self.ssb_head + SSB_TAPS] = (di, dq);
         let newest = self.ssb_head;
         self.ssb_head = (self.ssb_head + 1) % SSB_TAPS;
         self.ssb_phase = !self.ssb_phase;
@@ -123,12 +132,15 @@ impl Demodulator {
             return (wide, None);
         }
         let mut value = 0.;
-        let mut idx = newest;
-        for (re, im) in self.ssb_coeff {
-            let (i, q) = self.ssb_history[idx];
-            value += re * i - im * q;
-            idx = if idx == 0 { SSB_TAPS - 1 } else { idx - 1 };
+        let history = &self.ssb_history[newest + 1..newest + 1 + SSB_TAPS];
+        for ((&(re, im), &(i1, q1)), &(i2, q2)) in self.ssb_coeff[..SSB_TAPS / 2]
+            .iter()
+            .zip(history.iter().rev())
+            .zip(history.iter())
+        {
+            value += re * (i1 + i2) + im * (q2 - q1);
         }
+        value += self.ssb_coeff[SSB_TAPS / 2].0 * history[SSB_TAPS / 2].0;
         (wide, Some(self.sample(value)))
     }
 }
@@ -136,6 +148,71 @@ impl Demodulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Straight convolution oracle: deliberately does not use mirrored rings or
+    // coefficient symmetry. Exercise wrap boundaries with broadband input.
+    fn full_convolution(d: &mut Demodulator, i: i16, q: i16) -> ((i16, i16), Option<i16>) {
+        let (i, q) = d.fine.rotate(f32::from(i), f32::from(q));
+        let wide = (d.sample(i), d.sample(q));
+        d.dec_history[d.dec_head] = d.channel.rotate(i, q);
+        let newest = d.dec_head;
+        d.dec_head = (d.dec_head + 1) % DEC_TAPS;
+        d.dec_phase += 1;
+        if d.dec_phase != 5 {
+            return (wide, None);
+        }
+        d.dec_phase = 0;
+        let (mut di, mut dq) = (0., 0.);
+        for (n, &c) in d.dec_coeff.iter().enumerate() {
+            let (i, q) = d.dec_history[(newest + DEC_TAPS - n) % DEC_TAPS];
+            di += c * i;
+            dq += c * q;
+        }
+        d.ssb_history[d.ssb_head] = (di, dq);
+        let newest = d.ssb_head;
+        d.ssb_head = (d.ssb_head + 1) % SSB_TAPS;
+        d.ssb_phase = !d.ssb_phase;
+        if d.ssb_phase {
+            return (wide, None);
+        }
+        let mut value = 0.;
+        for (n, &(re, im)) in d.ssb_coeff.iter().enumerate() {
+            let (i, q) = d.ssb_history[(newest + SSB_TAPS - n) % SSB_TAPS];
+            value += re * i - im * q;
+        }
+        (wide, Some(d.sample(value)))
+    }
+    #[test]
+    fn symmetric_convolution_matches_full_filter() {
+        for offset in [-45_000, 0, 45_000] {
+            for mode in [Mode::Usb, Mode::Lsb] {
+                let settings = Settings {
+                    dial: 14_200_049,
+                    offset,
+                    mode,
+                    low: 0,
+                    high: 5000,
+                    ..Settings::default()
+                };
+                let mut fast = Demodulator::new(settings);
+                let mut reference = Demodulator::new(settings);
+                let mut random = 0x918u32;
+                for _ in 0..20_000 {
+                    random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let i = (random >> 16) as i16;
+                    random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let q = (random >> 16) as i16;
+                    let (wide, audio) = fast.process(i, q);
+                    let (expected_wide, expected_audio) = full_convolution(&mut reference, i, q);
+                    assert_eq!(wide, expected_wide);
+                    match (audio, expected_audio) {
+                        (Some(a), Some(b)) => assert!((i32::from(a) - i32::from(b)).abs() <= 1),
+                        (None, None) => {}
+                        _ => panic!("Decimation phase differs"),
+                    }
+                }
+            }
+        }
+    }
     fn tone(s: Settings, hz: f64) -> f64 {
         let mut d = Demodulator::new(s);
         let mut e = 0.;

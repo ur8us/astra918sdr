@@ -269,6 +269,9 @@ async fn engine_task(mut capture: capture::Capture) {
     let mut sequence = 0u32;
     let mut sample = 0u64;
     let mut settling = 12_000usize;
+    let mut timing_blocks = 0u32;
+    let mut timing_total = 0u64;
+    let mut timing_max = 0u64;
     loop {
         match select(ENGINE.receive(), Timer::after_micros(250)).await {
             Either::First((ticket, command)) => {
@@ -322,6 +325,7 @@ async fn engine_task(mut capture: capture::Capture) {
                 _ => {}
             }
             let mut frame = [0; a::IQ_FRAME];
+            let processing_start = Instant::now();
             frame[..a::IQ_HEADER].copy_from_slice(&radio.iq_header(sequence, sample));
             let mut pcm = [0i16; 52];
             let mut count = 0;
@@ -349,6 +353,20 @@ async fn engine_task(mut capture: capture::Capture) {
             }
             sequence = sequence.wrapping_add(1);
             sample += 512;
+            let elapsed = processing_start.elapsed().as_micros();
+            timing_total += elapsed;
+            timing_max = timing_max.max(elapsed);
+            timing_blocks += 1;
+            if timing_blocks == 1024 {
+                defmt::info!(
+                    "DSP block us: mean={} max={} budget=4267",
+                    timing_total / 1024,
+                    timing_max
+                );
+                timing_blocks = 0;
+                timing_total = 0;
+                timing_max = 0;
+            }
         }
     }
 }
@@ -454,7 +472,7 @@ async fn apply(
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    defmt::info!("Astra918 0.1.0; composite USB; offline build, hardware unqualified");
+    defmt::info!("Astra918 0.1.0; composite USB; development firmware");
     let mut flash = Storage::new_blocking(p.FLASH);
     let mut saved = None;
     for slot in 0..2 {
@@ -463,12 +481,10 @@ async fn main(spawner: Spawner) {
         let offset = nv::BASE + slot * 4096;
         if flash.blocking_read(offset, &mut b).is_ok()
             && flash.blocking_read(offset + 256, &mut c).is_ok()
+            && let Some(value) = nv::decode(&b, &c)
+            && saved.is_none_or(|(_, old)| nv::newer(value.1, old))
         {
-            if let Some(value) = nv::decode(&b, &c) {
-                if saved.is_none_or(|(_, old)| nv::newer(value.1, old)) {
-                    saved = Some(value);
-                }
-            }
+            saved = Some(value);
         }
     }
     let mut radio = Receiver::default();
@@ -526,7 +542,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(cat_task(cdc).unwrap());
     spawner.spawn(control_task(command, reply).unwrap());
     spawner.spawn(iq_task(iq).unwrap());
-    static STACK: StaticCell<Stack<32768>> = StaticCell::new();
+    static STACK: StaticCell<Stack<65536>> = StaticCell::new();
     static EXECUTOR: StaticCell<Executor> = StaticCell::new();
     let capture = capture::Capture::new(p.PIO0, p.DMA_CH0, p.PIN_8, p.PIN_9, p.PIN_10, Irqs);
     spawn_core1(p.CORE1, STACK.init(Stack::new()), move || {
@@ -605,15 +621,15 @@ async fn main(spawner: Spawner) {
                         let result =
                             apply(&mut radio, s, action, &mut chip, &mut flash, &mut save_seq)
                                 .await;
-                        if let Err(error) = result {
-                            if matches!(
+                        if let Err(error) = result
+                            && matches!(
                                 action,
                                 Action::Configure | Action::Retry | Action::Capacitor
-                            ) {
-                                let _ = engine(Engine::Pause).await;
-                                READY.store(false, Ordering::Release);
-                                radio.fault(error as u32);
-                            }
+                            )
+                        {
+                            let _ = engine(Engine::Pause).await;
+                            READY.store(false, Ordering::Release);
+                            radio.fault(error as u32);
                         }
                         result
                     }
