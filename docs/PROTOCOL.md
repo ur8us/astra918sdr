@@ -73,6 +73,11 @@ arbitrary first sequence/index; subsequent records within that generation
 must be contiguous. Retunes discard stale queued generations. SDR++ publishes
 matching frequency metadata before delivering the new samples. I/Q overflow
 stops only I/Q; CAT/audio continue. Stop/disconnect must not reset USB audio.
+Before Start, hosts should Stop and drain endpoint 85 to a quiet interval: a
+previous interrupted transfer may leave a partial old frame in the USB FIFO.
+Reset the frame parser only after draining. Keep I/Q reads independent of
+control exchanges; a receiver reconfiguration can take longer than the I/Q
+backpressure deadline. Join the reader before Stop/drain or transport teardown.
 
 CAT uses semicolon-delimited ASCII, bounded 32-byte requests. `FA`/`MD` read
 and set the dial/mode, `IF`, `ID`, `AI`, `FR`, `FW` are queries; `AI0`, `FR0`,

@@ -9,6 +9,7 @@ import glob
 import json
 import os
 import pathlib
+import signal
 import socket
 import struct
 import subprocess
@@ -63,7 +64,8 @@ BinsPerPixel=4
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.bind(('127.0.0.1', args.udp_port)); udp.settimeout(1)
     app = subprocess.Popen(['wsjtx', '--rig-name=AstraHardware'], env=env,
-                           stdout=(directory/'app.log').open('w'), stderr=subprocess.STDOUT)
+                           stdout=(directory/'app.log').open('w'), stderr=subprocess.STDOUT,
+                           start_new_session=True)
     print(f'WSJT-X PID {app.pid}; physical source {source}; logs {directory}', flush=True)
     deadline = time.monotonic()+args.seconds
     try:
@@ -84,9 +86,15 @@ BinsPerPixel=4
                 log.write(json.dumps(entry)+'\n'); log.flush()
                 if kind in (1, 2): print(entry, flush=True)
     finally:
-        if app.poll() is None: app.terminate()
+        # WSJT-X starts a jt9 decoder. End this isolated process group too,
+        # including a decoder whose GUI parent has already exited.
+        try: os.killpg(app.pid, signal.SIGTERM)
+        except ProcessLookupError: pass
         try: app.wait(timeout=5)
-        except subprocess.TimeoutExpired: app.kill(); app.wait()
+        except subprocess.TimeoutExpired:
+            os.killpg(app.pid, signal.SIGKILL); app.wait()
+        try: os.killpg(app.pid, signal.SIGKILL)
+        except ProcessLookupError: pass
         udp.close()
     print(f'Evidence retained in {directory}', flush=True)
 

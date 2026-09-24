@@ -63,6 +63,16 @@ class Receiver:
         usb.util.release_interface(self.device, 4)
         usb.util.dispose_resources(self.device)
 
+    def stop_iq(self):
+        self.command(0x31)
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                self.device.read(0x85, 16384, timeout=30)
+            except usb.core.USBTimeoutError:
+                return
+            assert time.monotonic() < deadline, 'I/Q did not stop'
+
 
 def cat(port, command):
     port.reset_input_buffer()
@@ -79,9 +89,14 @@ def restore(receiver, s):
     receiver.command(0x34, bytes([s['mode']]))
     receiver.command(0x35, struct.pack('<HH', s['low'], s['high']))
     receiver.command(0x33, struct.pack('<i', s['offset']))
-    receiver.command(0x24, bytes([s['input']]))
+    current = receiver.state()
     for block, name in enumerate(['rf_gain', 'if_gain', 'lf_gain', 'lf_attenuator']):
-        receiver.command(0x27, bytes([block, s[name]]))
+        if current[name] != s[name]:
+            if block >= 2:
+                receiver.command(0x24, b'\x01')
+            receiver.command(0x26, bytes([int(block == 1), 1]))
+            receiver.command(0x27, bytes([block, s[name]]))
+    receiver.command(0x24, bytes([s['input']]))
     for block, name in enumerate(['rf_manual', 'if_manual']):
         receiver.command(0x26, bytes([block, s[name]]))
     receiver.command(0x2d, struct.pack('<H', s['capacitor']))
@@ -110,6 +125,12 @@ def controls(receiver, port):
             for manual in [1, 0]:
                 receiver.command(0x26, bytes([block, manual]))
                 assert receiver.state()[['rf_manual', 'if_manual'][block]] == manual
+        receiver.command(0x24, b'\x01')
+        for block in range(2):
+            receiver.command(0x26, bytes([block, 1]))
+        for block, name in enumerate(['rf_gain', 'if_gain', 'lf_gain', 'lf_attenuator']):
+            receiver.command(0x27, bytes([block, 3]))
+            assert receiver.state()[name] == 3
         receiver.command(0x35, struct.pack('<HH', 300, 3000))
         assert cat(port, 'FW;') == 'FW2700;'
         receiver.command(0x2d, struct.pack('<H', 123))
@@ -117,6 +138,10 @@ def controls(receiver, port):
         assert receiver.state()['saved_revision'] == initial['saved_revision']
     finally:
         restore(receiver, initial)
+        restored = receiver.state()
+        for name in ['dial', 'offset', 'mode', 'low', 'high', 'input', 'rf_manual',
+                     'if_manual', 'rf_gain', 'if_gain', 'lf_gain', 'lf_attenuator', 'capacitor']:
+            assert restored[name] == initial[name], (name, initial, restored)
 
 
 def main():
@@ -139,6 +164,7 @@ def main():
     try:
         assert result['initial']['configured'] and not result['initial']['error'], result
         assert cat(port, 'ID;') == 'ID020;'
+        receiver.stop_iq()
         if args.controls:
             controls(receiver, port)
             result['controls'] = 'passed'
@@ -197,12 +223,17 @@ def main():
             s = receiver.state()
             assert not s['streaming'] and s['configured'] and not s['error'], s
             assert cat(port, 'FA;') == f"FA{s['dial']:011d};"
+            assert s['dropped'] > result['baseline']['dropped']
+            assert s['usb_faults'] > result['baseline']['usb_faults']
+            for name in ['capture_faults', 'underruns', 'overruns', 'audio_stalls']:
+                assert s[name] == result['baseline'][name], (name, s)
             result['stall'] = s
-        receiver.command(0x31)
+        receiver.stop_iq()
         before = (args.output/'audio.s16').stat().st_size
         time.sleep(2)
         assert (args.output/'audio.s16').stat().st_size > before
         assert cat(port, 'ID;') == 'ID020;'
+        result['stopped'] = receiver.state()
         result['audio_after_iq_stop'] = 'passed'
         result['passed'] = True
     finally:
@@ -215,7 +246,7 @@ def main():
             result['audio_samples'] = len(audio)
             result['audio_rms'] = float(np.sqrt(np.mean(audio*audio))) if len(audio) else 0
         try:
-            receiver.command(0x31)
+            receiver.stop_iq()
         except Exception as error:
             result['cleanup_error'] = repr(error)
         finally:
