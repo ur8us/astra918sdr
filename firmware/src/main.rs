@@ -426,6 +426,17 @@ async fn apply(
             r.commit(s, action);
             engine(Engine::Update(*r)).await?;
         }
+        Action::Channel => {
+            // The RF center is unchanged. Restart only the capture/DSP epoch;
+            // do not write the CMX918 PLL or recalibrate the RF path.
+            engine(Engine::Pause).await?;
+            while BLOCKS.try_receive().is_ok() {}
+            let mut next = *r;
+            next.commit(s, action);
+            GENERATION.store(next.generation, Ordering::Release);
+            engine(Engine::Run(next)).await?;
+            *r = next;
+        }
         Action::Start | Action::Stop => {
             if action == Action::Start && !r.configured {
                 return Err(Error::NotConfigured);
@@ -600,7 +611,10 @@ async fn main(spawner: Spawner) {
                             Err(e) => {
                                 if matches!(
                                     action,
-                                    Action::Configure | Action::Retry | Action::Capacitor
+                                    Action::Configure
+                                        | Action::Retry
+                                        | Action::Capacitor
+                                        | Action::Channel
                                 ) {
                                     let _ = engine(Engine::Pause).await;
                                     READY.store(false, Ordering::Release);
@@ -624,7 +638,10 @@ async fn main(spawner: Spawner) {
                         if let Err(error) = result
                             && matches!(
                                 action,
-                                Action::Configure | Action::Retry | Action::Capacitor
+                                Action::Configure
+                                    | Action::Retry
+                                    | Action::Capacitor
+                                    | Action::Channel
                             )
                         {
                             let _ = engine(Engine::Pause).await;

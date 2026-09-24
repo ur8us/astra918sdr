@@ -117,6 +117,17 @@ def controls(receiver, port):
                 receiver.command(0x20, struct.pack('<Q', initial['dial']))
                 assert cat(port, 'FA;') == f"FA{initial['dial']:011d};"
         receiver.command(0x33, struct.pack('<i', 59000), expected=7)
+        receiver.command(0x39, struct.pack('<Q', 14074000))
+        assert receiver.state()['offset'] == 0
+        for mode in [1, 2]:
+            receiver.command(0x34, bytes([mode]))
+            for offset in [-45049, 0, 45049]:
+                dial = 14074000 + offset
+                receiver.command(0x38, struct.pack('<Q', dial))
+                s = receiver.state()
+                assert s['center'] == 14074000 and s['offset'] == offset
+                assert cat(port, 'FA;') == f'FA{dial:011d};'
+        receiver.command(0x38, struct.pack('<Q', 14574000), expected=7)
         for rf_input in range(4):
             receiver.command(0x24, bytes([rf_input]))
             assert receiver.state()['input'] == rf_input
@@ -150,6 +161,7 @@ def main():
     parser.add_argument('--seconds', type=int, default=30)
     parser.add_argument('--controls', action='store_true')
     parser.add_argument('--stall', action='store_true')
+    parser.add_argument('--audio-backend', choices=['alsa', 'pipewire'], default='alsa')
     parser.add_argument('--output', type=pathlib.Path, required=True)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -160,7 +172,7 @@ def main():
     recording = None
     thread = None
     stop = threading.Event()
-    result = {'serial': args.serial, 'initial': receiver.state()}
+    result = {'serial': args.serial, 'initial': receiver.state(), 'audio_backend': args.audio_backend}
     try:
         assert result['initial']['configured'] and not result['initial']['error'], result
         assert cat(port, 'ID;') == 'ID020;'
@@ -168,9 +180,16 @@ def main():
         if args.controls:
             controls(receiver, port)
             result['controls'] = 'passed'
-        recording = subprocess.Popen(['arecord', '-q', '-D', 'hw:CARD=SDR,DEV=0',
-            '-f', 'S16_LE', '-r', '12000', '-c', '1', '-t', 'raw',
-            str(args.output/'audio.s16')], stderr=(args.output/'audio.log').open('w'))
+        if args.audio_backend == 'pipewire':
+            source = f'alsa_input.usb-Astra918_project_Astra918_Audio_CAT_SDR_{args.serial}-00.mono-fallback'
+            with (args.output/'audio.s16').open('wb') as audio:
+                recording = subprocess.Popen(['pw-record', '--target', source, '--rate', '12000',
+                    '--channels', '1', '--format', 's16', '-'], stdout=audio,
+                    stderr=(args.output/'audio.log').open('w'))
+        else:
+            recording = subprocess.Popen(['arecord', '-q', '-D', 'hw:CARD=SDR,DEV=0',
+                '-f', 'S16_LE', '-r', '12000', '-c', '1', '-t', 'raw',
+                str(args.output/'audio.s16')], stderr=(args.output/'audio.log').open('w'))
         time.sleep(1)
         assert recording.poll() is None, 'Audio capture failed'
         receiver.command(0x30)
@@ -236,13 +255,18 @@ def main():
         result['stopped'] = receiver.state()
         result['audio_after_iq_stop'] = 'passed'
         result['passed'] = True
+    except BaseException as error:
+        result['passed'] = False
+        result['error'] = repr(error)
+        raise
     finally:
         stop.set()
         if thread is not None:
             thread.join(timeout=3)
         if recording is not None:
             recording.terminate(); recording.wait(timeout=5)
-            audio = np.fromfile(args.output/'audio.s16', dtype='<i2').astype(np.float64)
+            path = args.output/'audio.s16'
+            audio = np.fromfile(path, dtype='<i2').astype(np.float64) if path.exists() else np.array([])
             result['audio_samples'] = len(audio)
             result['audio_rms'] = float(np.sqrt(np.mean(audio*audio))) if len(audio) else 0
         try:

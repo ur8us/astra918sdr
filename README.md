@@ -18,15 +18,22 @@ physical receiver: on-air FT8, simultaneous SDR++/WSJT-X operation, bidirectiona
 tuning, controls, I/Q stall isolation, Save and incomplete-record recovery.
 Native Windows/macOS hardware checks remain pending. See the
 [hardware record](docs/HARDWARE-2026-09-24.md) and
+[control update tests](docs/CONTROLS-2026-09-24.md), plus
 [offline validation](docs/VALIDATION.md). No frequency-generator tests are
 part of this project's acceptance procedure.
 
 ## Tuning
 
-`spectrum center = receive dial − channel offset`, in Hz. Tuning in CAT, SDR++,
-or the GUI keeps the offset. An explicit offset change keeps the dial and moves
-the spectrum. Example: dial 14,074,000 and offset +10,000 place the spectrum
+`spectrum center = receive dial − channel offset`, in Hz. CAT, the GUI and the
+SDR++ source panel's **Tune** button keep the offset. An explicit offset change
+keeps the dial and moves the spectrum. Example: dial 14,074,000 and offset +10,000 place the spectrum
 center at 14,064,000. CAT tuning to 7,074,000 moves that center to 7,064,000.
+
+SDR++'s **left-right** mode moves the linked channel inside the existing spectrum,
+updating its offset and the WSJT-X dial while keeping the RF center fixed.
+The **center/aim** mode sets offset zero and retunes the RF center with the dial.
+These modes require the updated firmware commands 38/39. Channel movement is
+limited so the entire USB/LSB passband stays within the received spectrum.
 
 The receiver is authoritative. Clients read its current state when connecting;
 they never restore an old frequency automatically. The entire USB/LSB audio
@@ -51,7 +58,7 @@ cargo build --locked --release -p astra918-host
 target/release/astra918-sim --cat-pty
 # In another terminal:
 target/release/astra918ctl --simulator 127.0.0.1:7350 status
-cargo run --locked --release --manifest-path ../astra918sdr-gui/Cargo.toml -- --simulator 127.0.0.1:7350
+cargo run --locked --manifest-path ../astra918sdr-gui/Cargo.toml -- --simulator 127.0.0.1:7350
 ```
 
 On Windows omit `--cat-pty` and use `.exe` executables. The simulator listens

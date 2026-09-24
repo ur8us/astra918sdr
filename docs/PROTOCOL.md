@@ -30,6 +30,8 @@ rejects a command without committing the proposed settings.
 | Audio mode | 34 | byte LSB=1 USB=2 |
 | Audio passband | 35 | low u16, high u16 Hz; 0 ≤ low < high ≤ 5000 |
 | Save / Retry | 36 / 37 | empty |
+| Tune channel within spectrum | 38 | u64 dial Hz; changes dial/offset atomically, retaining the current RF center |
+| Center channel and retune | 39 | u64 dial Hz; sets dial and RF center atomically with offset zero |
 
 IDs above are hexadecimal. Setters normally reply with the complete status
 snapshot. Legacy arbitrary sample-rate/FIR/register/BOOTSEL commands are not
@@ -37,6 +39,14 @@ part of this interface. Status codes: 0 OK, 1 command, 2 version, 3 length,
 4 argument, 5 unsupported, 6 busy, 7 spectrum bounds, 8 I/O, 9 PLL, 10 internal.
 Capabilities retain the inherited 204-byte layout; only rate slot zero (120000)
 is selectable. Do not mistake the inherited reserved rate slots for support.
+
+Command 38 requires a configured receiver and validates the complete audio
+passband inside the current spectrum. It changes the DSP epoch without writing
+the CMX918 PLL or recalibrating RF. Command 39 performs an RF retune and resets
+the channel offset. Both update the shared CAT dial in one transaction and
+start a new I/Q generation. Older firmware rejects them with status 1; update
+firmware before using the corresponding SDR++ tuning modes. Existing CAT and
+command 20 tuning still preserve offset; command 33 still preserves dial.
 
 The status payload is 128 bytes. Its authoritative fields are:
 

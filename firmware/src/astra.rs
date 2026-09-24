@@ -17,6 +17,10 @@ pub const MODE: u8 = 0x34;
 pub const AUDIO_FILTER: u8 = 0x35;
 pub const SAVE: u8 = 0x36;
 pub const RETRY: u8 = 0x37;
+/// Move the shared audio/CAT channel while retaining the current RF center.
+pub const CHANNEL_TUNE: u8 = 0x38;
+/// Tune the RF center and audio/CAT dial together, with zero channel offset.
+pub const CENTER_TUNE: u8 = 0x39;
 pub const STATE_SIZE: usize = 128;
 pub const IQ_HEADER: usize = 64;
 pub const IQ_SAMPLES: usize = 512;
@@ -96,6 +100,7 @@ impl Settings {
 pub enum Action {
     Query,
     Configure,
+    Channel,
     Capacitor,
     Start,
     Stop,
@@ -159,7 +164,7 @@ impl Receiver {
             | v2::STOP
             | SAVE
             | RETRY => 0,
-            v2::FREQUENCY_SET => 8,
+            v2::FREQUENCY_SET | CHANNEL_TUNE | CENTER_TUNE => 8,
             OFFSET | AUDIO_FILTER | v2::RATE_SET | v2::OPTIONS => 4,
             MODE | v2::INPUT_SET => 1,
             v2::GAIN_MODE | v2::GAIN_SET | v2::LF_MF_CAPACITOR_SET => 2,
@@ -171,6 +176,21 @@ impl Receiver {
         let action = match cmd {
             v2::FREQUENCY_SET => {
                 s.dial = u64::from_le_bytes(p.try_into().unwrap());
+                Action::Configure
+            }
+            CHANNEL_TUNE => {
+                if !self.configured {
+                    return Err(Status::Io);
+                }
+                let dial = u64::from_le_bytes(p.try_into().unwrap());
+                s.offset = i32::try_from(i128::from(dial) - i128::from(s.center()))
+                    .map_err(|_| Status::Bandwidth)?;
+                s.dial = dial;
+                Action::Channel
+            }
+            CENTER_TUNE => {
+                s.dial = u64::from_le_bytes(p.try_into().unwrap());
+                s.offset = 0;
                 Action::Configure
             }
             OFFSET => {
@@ -225,7 +245,7 @@ impl Receiver {
             self.revision = self.revision.wrapping_add(1);
         }
         match action {
-            Action::Configure | Action::Retry => {
+            Action::Configure | Action::Retry | Action::Channel => {
                 self.configured = true;
                 self.error = 0;
                 self.generation = self.generation.wrapping_add(1);
@@ -381,6 +401,48 @@ pub fn request(cmd: u8, seq: u32, payload: &[u8]) -> [u8; SIZE] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn channel_tuning_keeps_rf_center_and_updates_cat_atomically() {
+        let mut r = Receiver::default();
+        assert!(
+            r.prepare(CHANNEL_TUNE, &14_201_000u64.to_le_bytes())
+                .is_err()
+        );
+        r.commit(r.settings, Action::Configure);
+        r.commit(r.settings, Action::Start);
+        for mode in [Mode::Usb, Mode::Lsb] {
+            r.settings.mode = mode;
+            for offset in [-45_000i64, 0, 45_000] {
+                let center = r.settings.center();
+                let hardware = r.settings.hardware();
+                let dial = (center + offset) as u64;
+                let (s, action) = r.prepare(CHANNEL_TUNE, &dial.to_le_bytes()).unwrap();
+                assert_eq!(action, Action::Channel);
+                assert_eq!(r.settings.center(), center);
+                let generation = r.generation;
+                r.commit(s, action);
+                assert_eq!(r.settings.center(), center);
+                assert_eq!(r.settings.hardware(), hardware);
+                assert_eq!(r.settings.dial, dial);
+                assert_eq!(r.settings.offset, offset as i32);
+                assert_eq!(r.generation, generation + 1);
+                assert!(r.streaming && r.configured);
+                assert_eq!(r.saved_revision, u32::MAX);
+                assert_eq!(r.settings.tuning().frequency, dial as u32);
+            }
+        }
+        let original = r.settings;
+        for dial in [0, u64::MAX, 14_800_000] {
+            assert!(r.prepare(CHANNEL_TUNE, &dial.to_le_bytes()).is_err());
+            assert_eq!(r.settings, original);
+        }
+        let (s, action) = r.prepare(CENTER_TUNE, &7_074_049u64.to_le_bytes()).unwrap();
+        assert_eq!(action, Action::Configure);
+        r.commit(s, action);
+        assert_eq!(r.settings.dial, 7_074_049);
+        assert_eq!(r.settings.center(), 7_074_049);
+        assert_eq!(r.settings.offset, 0);
+    }
     #[test]
     fn shared_tuning_and_offset_semantics() {
         let mut r = Receiver::default();

@@ -48,7 +48,7 @@ fn apply(s: &mut Shared, settings: a::Settings, action: Action) -> Result<()> {
     if s.fail_next
         && matches!(
             action,
-            Action::Configure | Action::Capacitor | Action::Retry
+            Action::Configure | Action::Capacitor | Action::Retry | Action::Channel
         )
     {
         s.fail_next = false;
