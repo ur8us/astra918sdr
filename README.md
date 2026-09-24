@@ -24,16 +24,22 @@ part of this project's acceptance procedure.
 
 ## Tuning
 
-`spectrum center = receive dial − channel offset`, in Hz. CAT, the GUI and the
-SDR++ source panel's **Tune** button keep the offset. An explicit offset change
-keeps the dial and moves the spectrum. Example: dial 14,074,000 and offset +10,000 place the spectrum
-center at 14,064,000. CAT tuning to 7,074,000 moves that center to 7,064,000.
+`firmware audio/CAT dial = spectrum center + firmware USB audio offset`, in Hz.
+CAT tuning preserves offset and moves the spectrum. Example: dial 14,074,000
+and offset +10,000 place the spectrum center at 14,064,000. CAT tuning to
+7,074,000 moves that center to 7,064,000.
 
-SDR++'s **left-right** mode moves the linked channel inside the existing spectrum,
-updating its offset and the WSJT-X dial while keeping the RF center fixed.
-The **center/aim** mode sets offset zero and retunes the RF center with the dial.
-These modes require the updated firmware commands 38/39. Channel movement is
-limited so the entire USB/LSB passband stays within the received spectrum.
+SDR++ Radio VFOs control local listening independently. Moving a VFO inside the
+waterfall leaves firmware audio untouched. Moving the waterfall center retunes
+the receiver and CAT dial while preserving the firmware audio offset. The GUI
+exposes this same spectrum-center tuning. Both applications' audio offset controls
+move the firmware channel and CAT dial inside the fixed RF spectrum using
+command 38. The complete USB/LSB passband must remain within that spectrum.
+The legacy command 33/CLI offset operation still preserves dial and moves center.
+
+This center-based application update was compiled on Linux; runtime and hardware
+tests were not rerun, as requested. Earlier hardware reports describe the
+previous application tuning behavior.
 
 The receiver is authoritative. Clients read its current state when connecting;
 they never restore an old frequency automatically. The entire USB/LSB audio

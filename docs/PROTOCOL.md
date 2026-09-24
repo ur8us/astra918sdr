@@ -45,8 +45,13 @@ passband inside the current spectrum. It changes the DSP epoch without writing
 the CMX918 PLL or recalibrating RF. Command 39 performs an RF retune and resets
 the channel offset. Both update the shared CAT dial in one transaction and
 start a new I/Q generation. Older firmware rejects them with status 1; update
-firmware before using the corresponding SDR++ tuning modes. Existing CAT and
-command 20 tuning still preserve offset; command 33 still preserves dial.
+firmware before using command 38 for the applications' firmware audio offset
+control. Existing CAT and command 20 tuning still preserve offset; command 33
+still preserves dial. SDR++ and GUI center tuning send command 20 with
+`center + audio offset`; their audio offset edits send command 38 with
+`current center + new audio offset`. SDR++ Radio VFO offsets are independent
+and never enter this firmware audio calculation. Command 39 remains available
+for clients explicitly requesting zero-offset tuning.
 
 The status payload is 128 bytes. Its authoritative fields are:
 
