@@ -319,12 +319,17 @@ impl Receiver {
         let t = self.settings.tuning();
         match command {
             Command::Frequency(None) => Reply::frequency(t),
+            Command::FrequencyB => Reply::frequency_b(t),
             Command::Mode(None) => Reply::mode(t),
             Command::FilterWidth => Reply::filter_width(self.settings.high - self.settings.low),
+            Command::LowCutoff => Reply::low_cutoff(self.settings.low),
             Command::If => Reply::information(t),
             Command::Id => Reply::literal(b"ID020;"),
             Command::Ai => Reply::literal(b"AI0;"),
             Command::Fr => Reply::literal(b"FR0;"),
+            Command::Ft => Reply::literal(b"FT0;"),
+            Command::Power => Reply::literal(b"PS1;"),
+            Command::KeyerSpeed => Reply::literal(b"KS020;"),
             Command::Status => Reply::status(
                 self.configured,
                 self.error,
@@ -487,5 +492,22 @@ mod tests {
         assert!(r.configured);
         assert!(!r.streaming);
         assert_eq!(r.cat_reply(Command::Id).len, 6);
+    }
+    #[test]
+    fn wsjtx_queries_report_live_dial_and_valid_read_only_values() {
+        let mut r = Receiver::default();
+        let (settings, action) = r.prepare(CENTER_TUNE, &7_074_000u64.to_le_bytes()).unwrap();
+        r.commit(settings, action);
+        for (command, expected) in [
+            (Command::FrequencyB, b"FB00007074000;".as_slice()),
+            (Command::Ft, b"FT0;"),
+            (Command::Power, b"PS1;"),
+            (Command::KeyerSpeed, b"KS020;"),
+            (Command::LowCutoff, b"SL02;"),
+        ] {
+            let reply = r.cat_reply(command);
+            assert_eq!(&reply.bytes[..reply.len], expected);
+            assert!(r.cat_prepare(command).unwrap().is_none());
+        }
     }
 }

@@ -109,7 +109,7 @@ flash capacity and inherited pinout before programming a different board.
 
 ## WSJT-X with the receiver
 
-Select **Kenwood TS-480**, its CDC serial port, 115200 baud, no handshake,
+Select **Kenwood TS-480** or **Kenwood TS-570D**, its CDC serial port, 115200 baud, no handshake,
 PTT VOX, Split None, Poll 1 s, and Mode None (preserves the firmware mode chosen
 in the controller). Select Astra918 as recording input. Keep Enable Tx off:
 this is a receive-only device. Select a band in WSJT-X normally.

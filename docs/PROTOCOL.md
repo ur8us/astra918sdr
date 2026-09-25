@@ -95,8 +95,13 @@ control exchanges; a receiver reconfiguration can take longer than the I/Q
 backpressure deadline. Join the reader before Stop/drain or transport teardown.
 
 CAT uses semicolon-delimited ASCII, bounded 32-byte requests. `FA`/`MD` read
-and set the dial/mode, `IF`, `ID`, `AI`, `FR`, `FW` are queries; `AI0`, `FR0`,
-`RX` are receive-only acknowledgements. `ZZST` reads health; `ZZRX` retries.
+and set the dial/mode; `IF`, `ID`, `AI`, `FR`, `FW`, `FB`, `FT`, `PS`, `KS` and
+`SL` are queries. The latter five answer WSJT-X/Hamlib initialization and
+polling without introducing transmit or a second VFO: `FB` mirrors the shared
+dial, `FT0` reports VFO A, `PS1` reports the powered receiver, `KS020` is a
+fixed compatible keyer-speed value, and `SL` approximates the actual audio
+low cutoff in the Kenwood 00..20 range. `AI0`, `FR0`, `RX` are receive-only
+acknowledgements. `ZZST` reads health; `ZZRX` retries.
 Unsupported or invalid commands return `?;`; successful setters return no
 text. Timeouts discard incomplete frames through their next delimiter. No TX
 command is implemented. FW reports width in Hz, supported by Hamlib’s custom

@@ -44,12 +44,17 @@ impl Tuning {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Frequency(Option<u32>),
+    FrequencyB,
     Mode(Option<Mode>),
     FilterWidth,
+    LowCutoff,
     If,
     Id,
     Ai,
     Fr,
+    Ft,
+    Power,
+    KeyerSpeed,
     Ack,
     Status,
     Retry,
@@ -58,14 +63,19 @@ pub enum Command {
 pub fn parse(bytes: &[u8]) -> Result<Command, Error> {
     match bytes {
         b"FA" => Ok(Command::Frequency(None)),
+        b"FB" => Ok(Command::FrequencyB),
         b"MD" => Ok(Command::Mode(None)),
         b"FW" => Ok(Command::FilterWidth),
+        b"SL" => Ok(Command::LowCutoff),
         b"MD1" => Ok(Command::Mode(Some(Mode::Lsb))),
         b"MD2" => Ok(Command::Mode(Some(Mode::Usb))),
         b"IF" => Ok(Command::If),
         b"ID" => Ok(Command::Id),
         b"AI" => Ok(Command::Ai),
         b"FR" => Ok(Command::Fr),
+        b"FT" => Ok(Command::Ft),
+        b"PS" => Ok(Command::Power),
+        b"KS" => Ok(Command::KeyerSpeed),
         b"AI0" | b"FR0" | b"RX" => Ok(Command::Ack),
         b"ZZST" => Ok(Command::Status),
         b"ZZRX" => Ok(Command::Retry),
@@ -157,6 +167,12 @@ impl Reply {
         r.decimal(2, 11, tuning.frequency);
         r
     }
+    pub fn frequency_b(tuning: Tuning) -> Self {
+        // The receiver has one shared dial; report it on both VFO reads.
+        let mut r = Self::frequency(tuning);
+        r.bytes[1] = b'B';
+        r
+    }
     pub fn mode(tuning: Tuning) -> Self {
         let mut r = Self::literal(b"MD0;");
         r.bytes[2] = tuning.mode.digit();
@@ -165,6 +181,14 @@ impl Reply {
     pub fn filter_width(width: u16) -> Self {
         let mut r = Self::literal(b"FW0000;");
         r.decimal(2, 4, u32::from(width));
+        r
+    }
+    pub fn low_cutoff(low: u16) -> Self {
+        // TS-570 SL uses codes 00..20 for approximately 10..1000 Hz.
+        // Round to a code; the exact filter edge remains available over AST1.
+        let mut r = Self::literal(b"SL00;");
+        let code = (u32::from(low.clamp(10, 1000) - 10) * 20 + 495) / 990;
+        r.decimal(2, 2, code);
         r
     }
     pub fn information(tuning: Tuning) -> Self {
@@ -276,5 +300,29 @@ mod tests {
             &r.bytes[..r.len],
             b"ZZST1,09,0000000123,0000000456,0000000789,0000000101;"
         );
+        assert_eq!(&Reply::frequency_b(t).bytes[..14], b"FB00014200000;");
+        assert_eq!(&Reply::low_cutoff(100).bytes[..5], b"SL02;");
+        assert_eq!(&Reply::low_cutoff(5000).bytes[..5], b"SL20;");
+    }
+    #[test]
+    fn wsjtx_read_only_queries_do_not_accept_setters() {
+        for (query, command) in [
+            (b"PS".as_slice(), Command::Power),
+            (b"KS", Command::KeyerSpeed),
+            (b"FB", Command::FrequencyB),
+            (b"FT", Command::Ft),
+            (b"SL", Command::LowCutoff),
+        ] {
+            assert_eq!(parse(query), Ok(command));
+        }
+        for setter in [
+            b"PS0".as_slice(),
+            b"KS020",
+            b"FB00014200000",
+            b"FT0",
+            b"SL02",
+        ] {
+            assert!(parse(setter).is_err());
+        }
     }
 }
