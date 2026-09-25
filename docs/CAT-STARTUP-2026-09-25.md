@@ -25,4 +25,7 @@ retune from 18.635 to 18.640 MHz reached the source DLL callback. The main
 waterfall frequency scale moved so 18.640 MHz was at its center, then moved
 back when the dial was restored. The left-hand RX1 frequency stayed at its
 independent, previously selected value. This test confirms source/waterfall
-centering, not automatic tuning of SDR Console's local RX1 listener.
+centering for a small change, not automatic tuning of SDR Console's local RX1
+listener. A later 100 kHz retune exposed an intermittent waterfall centering
+problem; the matching I/Q-frame callback gate is implemented in the sibling
+`sdr-console-wine` source DLL.
