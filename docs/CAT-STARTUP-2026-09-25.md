@@ -29,3 +29,12 @@ centering for a small change, not automatic tuning of SDR Console's local RX1
 listener. A later 100 kHz retune exposed an intermittent waterfall centering
 problem; the matching I/Q-frame callback gate is implemented in the sibling
 `sdr-console-wine` source DLL.
+
+Correction, September 27: the I/Q-frame gate did not fix normal-launch
+waterfall centering. The source callback was missing its second argument,
+which requests recentering. Diagnostic logging masked that ABI mistake in
+the earlier display tests. Source DLL 0.1.1 supplies the flag explicitly and
+was checked with tracing disabled and no window input during external
+retunes. See the sibling repository's `astra918/FREQUENCY-CALLBACK.md` for
+the reproduction and validation. This host DLL correction required no
+firmware change.
