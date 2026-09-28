@@ -1,4 +1,4 @@
-name: Offline firmware and host
+name: Host tests
 on: [push, pull_request, workflow_dispatch]
 jobs:
   host:
@@ -11,28 +11,3 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.90.0
       - run: cargo test --locked --workspace
       - run: cargo build --locked --release -p astra918-host
-  firmware:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        variant: [rp235xa, rp235xb]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.90.0
-        with:
-          targets: thumbv8m.main-none-eabihf
-      - name: Install picotool
-        run: |
-          curl --fail --location --silent --show-error \
-            https://github.com/raspberrypi/pico-sdk-tools/releases/download/v2.3.1-0/picotool-2.3.1-x86_64-lin.tar.gz \
-            --output "$RUNNER_TEMP/picotool.tar.gz"
-          echo "878a1a1e7d8336b8be60300c7218f366d9790c0d3a211b181d6d172e80b1248e  $RUNNER_TEMP/picotool.tar.gz" | sha256sum --check
-          tar -xzf "$RUNNER_TEMP/picotool.tar.gz" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/picotool" >> "$GITHUB_PATH"
-      - name: Build ELF and UF2
-        run: python3 scripts/build_firmware.py --variant ${{ matrix.variant }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: firmware-${{ matrix.variant }}
-          path: artifacts/${{ matrix.variant }}/
-          if-no-files-found: error

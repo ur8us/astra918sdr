@@ -103,6 +103,10 @@ build files. The board configuration assumes a 12 MHz MCU crystal and 4 MiB
 flash, reserving the final 8 KiB for settings. Confirm the board variant,
 flash capacity and inherited pinout before programming a different board.
 
+For automated builds, open the latest successful **Firmware UF2** run in
+GitHub Actions and download its `astra918-rp2350a-and-rp2350b-uf2` artifact.
+The ZIP contains an `astra918.uf2` file in each variant's directory.
+
 ## WSJT-X with the receiver
 
 Select **Kenwood TS-480** or **Kenwood TS-570D**, its CDC serial port, 115200 baud, no handshake,

@@ -1,0 +1,32 @@
+name: Firmware UF2
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: thumbv8m.main-none-eabihf
+      - name: Install picotool
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/raspberrypi/pico-sdk-tools/releases/download/v2.3.1-0/picotool-2.3.1-x86_64-lin.tar.gz \
+            --output "$RUNNER_TEMP/picotool.tar.gz"
+          echo "878a1a1e7d8336b8be60300c7218f366d9790c0d3a211b181d6d172e80b1248e  $RUNNER_TEMP/picotool.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/picotool.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/picotool" >> "$GITHUB_PATH"
+      - name: Build RP2350A UF2
+        run: python3 scripts/build_firmware.py --variant rp235xa
+      - name: Build RP2350B UF2
+        run: python3 scripts/build_firmware.py --variant rp235xb
+      - name: Upload both UF2 files
+        uses: actions/upload-artifact@v4
+        with:
+          name: astra918-rp2350a-and-rp2350b-uf2
+          path: |
+            artifacts/rp235xa/astra918.uf2
+            artifacts/rp235xb/astra918.uf2
+          if-no-files-found: error
