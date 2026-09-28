@@ -21,8 +21,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
           targets: thumbv8m.main-none-eabihf
-      - run: cargo build --locked --release -p astra918-firmware --bin astra918 --target thumbv8m.main-none-eabihf --features device,${{ matrix.variant }}
+      - name: Install picotool
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes picotool
+      - name: Build ELF and UF2
+        run: python3 scripts/build_firmware.py --variant ${{ matrix.variant }}
       - uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ matrix.variant }}-elf
-          path: target/thumbv8m.main-none-eabihf/release/astra918
+          name: firmware-${{ matrix.variant }}
+          path: artifacts/${{ matrix.variant }}/
+          if-no-files-found: error
