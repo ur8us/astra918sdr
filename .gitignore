@@ -1,4 +1,6 @@
 /target/
 /artifacts/
+/docs/
+/target/
 __pycache__/
 *.pyc
