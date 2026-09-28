@@ -9,18 +9,14 @@ Keep these independent repositories adjacent:
 
 ```
 astra918sdr/          firmware, shared state/DSP, simulator, CLI
-astra918sdr-sdrpp/    portable C++ library and SDR++ source module
 astra918sdr-gui/      Rust light-theme controls/status GUI
 ```
 
 The RP2350A firmware and both Linux applications have been tested with the
 physical receiver: on-air FT8, simultaneous SDR++/WSJT-X operation, bidirectional
 tuning, controls, I/Q stall isolation, Save and incomplete-record recovery.
-Native Windows/macOS hardware checks remain pending. See the
-[hardware record](docs/HARDWARE-2026-09-24.md) and
-[control update tests](docs/CONTROLS-2026-09-24.md), plus
-[offline validation](docs/VALIDATION.md). No frequency-generator tests are
-part of this project's acceptance procedure.
+Native Windows/macOS hardware checks remain pending. No frequency-generator
+tests are part of this project's acceptance procedure.
 
 ## Tuning
 
