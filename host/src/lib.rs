@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use astra918_firmware::{astra as a, control_v2 as v2};
 pub use astra918_firmware::{
-    astra::{Receiver, Settings},
+    astra::{Receiver, ReferenceClock, Settings},
     cat::Mode,
     controls::{Controls, RfInput},
 };
@@ -175,6 +175,9 @@ pub fn decode(p: &[u8]) -> Result<Receiver> {
             lf_gain: p[78],
             lf_attenuator: p[79],
         },
+        reference: ReferenceClock::parse(p[118])
+            .map_err(|_| anyhow::anyhow!("Invalid reference clock"))?,
+        gpio: p[119],
     };
     settings
         .validate()

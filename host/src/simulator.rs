@@ -48,7 +48,7 @@ fn apply(s: &mut Shared, settings: a::Settings, action: Action) -> Result<()> {
     if s.fail_next
         && matches!(
             action,
-            Action::Configure | Action::Capacitor | Action::Retry | Action::Channel
+            Action::Configure | Action::Clock | Action::Capacitor | Action::Retry | Action::Channel
         )
     {
         s.fail_next = false;
@@ -68,7 +68,14 @@ fn apply(s: &mut Shared, settings: a::Settings, action: Action) -> Result<()> {
         f.sync_all()?;
         s.save_sequence = seq;
     }
-    s.radio.commit(settings, action);
+    s.radio.commit(
+        settings,
+        if action == Action::Clock {
+            Action::Configure
+        } else {
+            action
+        },
+    );
     Ok(())
 }
 fn control(mut socket: TcpStream, state: State, owner: Arc<AtomicBool>) {

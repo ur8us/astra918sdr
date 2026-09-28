@@ -2,8 +2,8 @@
 //! registers 03,08–0B,28–2A,5A–5C,B7–BA,D0–D1,D7–D9.
 //! Uses documented defaults rather than replaying captured readbacks/poll counts.
 
-use crate::controls::Controls;
 use crate::{Config, Error};
+use crate::{astra::ReferenceClock, controls::Controls};
 use embedded_hal_async::{delay::DelayNs, i2c::I2c};
 
 pub const ADDRESS: u8 = 0x55;
@@ -36,9 +36,25 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
     where
         I: crate::recovery::Recover,
     {
+        self.configure_recovering_clock(config, controls, ReferenceClock::Internal)
+            .await
+    }
+
+    pub async fn configure_recovering_clock(
+        &mut self,
+        config: Config,
+        controls: Controls,
+        reference: ReferenceClock,
+    ) -> Result<(), Error>
+    where
+        I: crate::recovery::Recover,
+    {
         config.validate()?;
         controls.validate(config)?;
-        match self.configure_controls(config, controls).await {
+        match self
+            .configure_controls_clock(config, controls, reference)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(error @ (Error::I2c | Error::Timeout | Error::Readback)) => {
                 #[cfg(target_arch = "arm")]
@@ -50,7 +66,9 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
                 let _ = error;
                 self.bus.recover().await.map_err(|_| Error::I2c)?;
                 self.reset().await?;
-                let result = self.configure_controls(config, controls).await;
+                let result = self
+                    .configure_controls_clock(config, controls, reference)
+                    .await;
                 #[cfg(target_arch = "arm")]
                 defmt::info!(
                     "CMX918 configuration recovery result={}",
@@ -124,11 +142,23 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
         config: Config,
         controls: Controls,
     ) -> Result<(), Error> {
+        self.configure_controls_clock(config, controls, ReferenceClock::Internal)
+            .await
+    }
+
+    pub async fn configure_controls_clock(
+        &mut self,
+        config: Config,
+        controls: Controls,
+        reference: ReferenceClock,
+    ) -> Result<(), Error> {
         let config = config.validate()?;
         let controls = controls.validate(config)?;
         // Stop capture before entering this routine. Standby quiesces processing
         // even if a pre-existing stream's frame-synchronous mute cannot finish.
         self.write(0x03, 1).await?;
+        // CLK_CTL bit 0 selects crystal/TCXO; preserve the clock output settings.
+        self.update(0x07, 1, reference as u8).await?;
         self.write(0x97, config.xtal_control()).await?;
         self.delay.delay_ms(10).await;
         self.write(0x28, config.output_control(true)).await?;
@@ -177,8 +207,32 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
             self.write(0xd8, msb).await?;
             self.write(0xd9, lsb).await?; // LSB commits coefficient, no auto-increment
         }
+        let high_band = config.frequency > 130_000_000;
+        if high_band {
+            // Above the normal range, auto calculation can select L=3. This
+            // silicon cannot use L=3, so program the documented manual PLL
+            // formula with L=4 and a 96 kHz low-side IF instead.
+            let lo = u64::from(config.frequency - 96_000);
+            let scaled = (lo * 16 * (1 << 24) + 19_200_000) / 38_400_000;
+            let n = (scaled >> 24) as u16;
+            let f = (scaled & 0x00ff_ffff) as u32;
+            self.write(0x2a, 1).await?; // manual L, fractional DSM
+            for (reg, value) in [
+                (0x2b, (n >> 8) as u8),
+                (0x2c, n as u8),
+                (0x2d, (f >> 16) as u8),
+                (0x2e, (f >> 8) as u8),
+                (0x2f, f as u8),
+                (0x31, 0),
+                (0x32, 4),
+            ] {
+                self.write(reg, value).await?;
+            }
+        }
         self.write(0x03, 3).await?;
-        self.write(0x29, 5).await?; // IF filter + automatic PLL and VCO calibration
+        self.write(0x29, if high_band { 6 } else { 5 }).await?;
+        // Normal tuning: IF filter and automatic PLL/VCO calibration.
+        // High band: IF filter and VCO sub-band selection for manual L=4.
         for attempt in 0..200 {
             if self.read(0x29).await? & 7 == 0 {
                 break;
@@ -199,6 +253,13 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
         }
         if !locked {
             return Err(Error::Timeout);
+        }
+        if high_band {
+            let divider =
+                u16::from(self.read(0x33).await?) << 8 | u16::from(self.read(0x34).await?);
+            if divider != 4 {
+                return Err(Error::Timeout);
+            }
         }
         // Ported from cmx918audiocat 5e4d7d9 (MIT). DS p.28: writing Fc
         // alone does not execute PLL calculation. Preserve the calibrated PLL.
@@ -492,6 +553,10 @@ mod tests {
                             if reg == 0x28 {
                                 self.regs[0x60] = u8::from(value & 8 != 0);
                             }
+                            if reg == 0x32 && self.regs[0x2a] & 2 == 0 {
+                                self.regs[0x33] = self.regs[0x31];
+                                self.regs[0x34] = value;
+                            }
                             reg += 1;
                         }
                     }
@@ -610,6 +675,50 @@ mod tests {
             assert_eq!(chip.bus.regs[0x28], 0x9b);
             chip.mute(false).await.unwrap();
             assert_eq!(chip.bus.regs[0x60], 0);
+        });
+    }
+    #[test]
+    fn reference_selection_preserves_clock_output_bits_and_recovers_after_reset() {
+        futures::executor::block_on(async {
+            let mut chip = Chip::new(Bus::new(), Delay);
+            chip.bus.regs[0x07] = 0x32;
+            chip.configure_recovering_clock(
+                config(),
+                Controls::default(),
+                ReferenceClock::External,
+            )
+            .await
+            .unwrap();
+            assert_eq!(chip.bus.regs[0x07], 0x33);
+            assert_eq!(chip.bus.regs[0x97] & 1, 1);
+            chip.configure_recovering_clock(
+                config(),
+                Controls::default(),
+                ReferenceClock::Internal,
+            )
+            .await
+            .unwrap();
+            assert_eq!(chip.bus.regs[0x07], 0x32);
+        });
+    }
+    #[test]
+    fn high_band_programs_manual_l_four() {
+        futures::executor::block_on(async {
+            let mut chip = Chip::new(Bus::new(), Delay);
+            let high = Config {
+                frequency: 170_000_000,
+                flags: config().flags | crate::EXPERIMENTAL_RF,
+                ..config()
+            };
+            chip.configure(high).await.unwrap();
+            assert_eq!(chip.bus.regs[0x2a], 1);
+            assert_eq!(chip.bus.regs[0x32], 4);
+            assert_eq!(chip.bus.regs[0x34], 4);
+            assert!(chip.bus.writes.contains(&(0x29, 6)));
+            let scaled =
+                (u64::from(high.frequency - 96_000) * 16 * (1 << 24) + 19_200_000) / 38_400_000;
+            assert_eq!(chip.bus.regs[0x2c], (scaled >> 24) as u8);
+            assert_eq!(chip.bus.regs[0x2f], scaled as u8);
         });
     }
     #[test]

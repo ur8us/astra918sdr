@@ -1,5 +1,5 @@
 //! Receiver controls, UM918/2.0 pp.15,17–18,23,26,65 and DS pp.20–21.
-use crate::{Config, Error};
+use crate::{Config, EXPERIMENTAL_MAX_HZ, EXPERIMENTAL_MIN_HZ, Error};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
@@ -124,7 +124,7 @@ impl Controls {
     }
 }
 pub fn round_frequency(hz: u64) -> Result<u32, Error> {
-    if !(70_000..=130_000_000).contains(&hz) {
+    if !(u64::from(EXPERIMENTAL_MIN_HZ)..=u64::from(EXPERIMENTAL_MAX_HZ)).contains(&hz) {
         return Err(Error::Frequency);
     }
     Ok(((hz + 50) / 100 * 100) as u32)
@@ -160,6 +160,7 @@ mod tests {
             (39_999_900, RfInput::Hf),
             (40_000_000, RfInput::Vhf),
             (130_000_000, RfInput::Vhf),
+            (170_000_000, RfInput::Vhf),
         ] {
             assert_eq!(RfInput::Auto.actual(hz), input);
         }

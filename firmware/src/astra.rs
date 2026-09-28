@@ -1,6 +1,6 @@
 //! Astra control protocol and authoritative, host-testable receiver state.
 use crate::{
-    Config,
+    Config, EXPERIMENTAL_MAX_HZ, EXPERIMENTAL_MIN_HZ,
     cat::{Command, Mode, Reply, Tuning},
     control_v2 as v2,
     controls::Controls,
@@ -21,12 +21,31 @@ pub const RETRY: u8 = 0x37;
 pub const CHANNEL_TUNE: u8 = 0x38;
 /// Tune the RF center and audio/CAT dial together, with zero channel offset.
 pub const CENTER_TUNE: u8 = 0x39;
+pub const REFERENCE_SET: u8 = 0x3a;
+pub const GPIO_UPDATE: u8 = 0x3b;
 pub const STATE_SIZE: usize = 128;
 pub const IQ_HEADER: usize = 64;
 pub const IQ_SAMPLES: usize = 512;
 pub const IQ_FRAME: usize = IQ_HEADER + IQ_SAMPLES * 4;
 pub const RATE: u32 = 120_000;
 pub const OPTIONS: u32 = 0x18b;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ReferenceClock {
+    #[default]
+    Internal = 0,
+    External = 1,
+}
+impl ReferenceClock {
+    pub fn parse(raw: u8) -> Result<Self, Status> {
+        match raw {
+            0 => Ok(Self::Internal),
+            1 => Ok(Self::External),
+            _ => Err(Status::Argument),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -36,6 +55,8 @@ pub struct Settings {
     pub low: u16,
     pub high: u16,
     pub controls: Controls,
+    pub reference: ReferenceClock,
+    pub gpio: u8,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -46,6 +67,8 @@ impl Default for Settings {
             low: 100,
             high: 3500,
             controls: Controls::default(),
+            reference: ReferenceClock::Internal,
+            gpio: 0,
         }
     }
 }
@@ -62,8 +85,9 @@ impl Settings {
         }
     }
     pub fn validate(self) -> Result<Self, Status> {
-        if !(70_000..=130_000_000).contains(&self.dial)
-            || !(70_000..=130_000_000).contains(&self.center())
+        if !(u64::from(EXPERIMENTAL_MIN_HZ)..=u64::from(EXPERIMENTAL_MAX_HZ)).contains(&self.dial)
+            || !(i64::from(EXPERIMENTAL_MIN_HZ)..=i64::from(EXPERIMENTAL_MAX_HZ))
+                .contains(&self.center())
             || self.low >= self.high
             || self.high > 5000
         {
@@ -102,6 +126,8 @@ pub enum Action {
     Configure,
     Channel,
     Capacitor,
+    Logical,
+    Clock,
     Start,
     Stop,
     Save,
@@ -166,8 +192,8 @@ impl Receiver {
             | RETRY => 0,
             v2::FREQUENCY_SET | CHANNEL_TUNE | CENTER_TUNE => 8,
             OFFSET | AUDIO_FILTER | v2::RATE_SET | v2::OPTIONS => 4,
-            MODE | v2::INPUT_SET => 1,
-            v2::GAIN_MODE | v2::GAIN_SET | v2::LF_MF_CAPACITOR_SET => 2,
+            MODE | v2::INPUT_SET | REFERENCE_SET => 1,
+            v2::GAIN_MODE | v2::GAIN_SET | v2::LF_MF_CAPACITOR_SET | GPIO_UPDATE => 2,
             _ => return Err(Status::Command),
         };
         if p.len() != n {
@@ -196,6 +222,14 @@ impl Receiver {
             OFFSET => {
                 s.offset = i32::from_le_bytes(p.try_into().unwrap());
                 Action::Configure
+            }
+            REFERENCE_SET => {
+                s.reference = ReferenceClock::parse(p[0])?;
+                Action::Clock
+            }
+            GPIO_UPDATE => {
+                s.gpio = (s.gpio & !p[0]) | (p[1] & p[0]);
+                Action::Logical
             }
             MODE => {
                 s.mode = match p[0] {
@@ -245,7 +279,7 @@ impl Receiver {
             self.revision = self.revision.wrapping_add(1);
         }
         match action {
-            Action::Configure | Action::Retry | Action::Channel => {
+            Action::Configure | Action::Clock | Action::Retry | Action::Channel => {
                 self.configured = true;
                 self.error = 0;
                 self.generation = self.generation.wrapping_add(1);
@@ -253,6 +287,7 @@ impl Receiver {
             Action::Capacitor => {
                 self.error = 0;
             }
+            Action::Logical => {}
             Action::Start => {
                 self.streaming = true;
                 self.generation = self.generation.wrapping_add(1);
@@ -303,6 +338,9 @@ impl Receiver {
         p[92] = s.mode.digit() - b'0';
         p[94..96].copy_from_slice(&s.low.to_le_bytes());
         p[116..118].copy_from_slice(&s.high.to_le_bytes());
+        p[118] = s.reference as u8;
+        p[119] = s.gpio;
+        p[120] = 0xc0;
         p
     }
     pub fn cat_prepare(&self, command: Command) -> Result<Option<(Settings, Action)>, Status> {
@@ -406,6 +444,51 @@ pub fn request(cmd: u8, seq: u32, payload: &[u8]) -> [u8; SIZE] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reference_and_gpio_are_receiver_owned_and_do_not_restart_iq() {
+        let mut r = Receiver::default();
+        r.commit(r.settings, Action::Configure);
+        r.commit(r.settings, Action::Start);
+        let generation = r.generation;
+        assert_eq!(r.prepare(REFERENCE_SET, &[2]), Err(Status::Argument));
+        assert_eq!(r.prepare(GPIO_UPDATE, &[1]), Err(Status::Length));
+        let (s, action) = r.prepare(GPIO_UPDATE, &[0x05, 0x05]).unwrap();
+        assert_eq!(action, Action::Logical);
+        r.commit(s, action);
+        assert_eq!(r.settings.gpio, 5);
+        let (s, action) = r.prepare(GPIO_UPDATE, &[0x01, 0]).unwrap();
+        r.commit(s, action);
+        assert_eq!(r.settings.gpio, 4);
+        assert_eq!(r.generation, generation);
+        assert!(r.streaming && r.configured);
+        assert_eq!(r.encode()[119], 4);
+        let (s, action) = r.prepare(REFERENCE_SET, &[1]).unwrap();
+        assert_eq!(action, Action::Clock);
+        r.fault(6);
+        r.commit(s, action);
+        assert_eq!(r.encode()[118], 1);
+        assert_eq!(r.encode()[120], 0xc0);
+        assert!(r.configured);
+        assert_eq!(r.error, 0);
+        assert_eq!(r.generation, generation + 1);
+        assert_eq!(r.saved_revision, u32::MAX);
+    }
+
+    #[test]
+    fn experimental_tuning_bounds_preserve_audio_offset() {
+        let mut r = Receiver::default();
+        let (s, action) = r.prepare(OFFSET, &1000i32.to_le_bytes()).unwrap();
+        r.commit(s, action);
+        let (s, action) = r
+            .prepare(v2::FREQUENCY_SET, &170_000_000u64.to_le_bytes())
+            .unwrap();
+        r.commit(s, action);
+        assert_eq!(r.settings.center(), 169_999_000);
+        assert!(
+            r.prepare(v2::FREQUENCY_SET, &170_000_001u64.to_le_bytes())
+                .is_err()
+        );
+    }
     #[test]
     fn channel_tuning_keeps_rf_center_and_updates_cat_atomically() {
         let mut r = Receiver::default();

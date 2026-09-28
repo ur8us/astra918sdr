@@ -47,6 +47,14 @@ enum Command {
     Capacitor {
         code: u16,
     },
+    Reference {
+        #[arg(value_parser=["internal","external"])]
+        source: String,
+    },
+    Gpio {
+        index: u8,
+        value: u8,
+    },
     Save,
     Retry,
     Start,
@@ -93,6 +101,18 @@ fn main() -> Result<()> {
         ),
         Command::Gain { block, code } => (v2::GAIN_SET, vec![block, code]),
         Command::Capacitor { code } => (v2::LF_MF_CAPACITOR_SET, code.to_le_bytes().to_vec()),
+        Command::Reference { source } => (a::REFERENCE_SET, vec![u8::from(source == "external")]),
+        Command::Gpio { index, value } => {
+            anyhow::ensure!(
+                index < 8 && value <= 1,
+                "GPIO needs index 0..7 and value 0 or 1"
+            );
+            let mask = 1u8 << index;
+            (
+                a::GPIO_UPDATE,
+                vec![mask, if value == 1 { mask } else { 0 }],
+            )
+        }
         Command::Save => (a::SAVE, vec![]),
         Command::Retry => (a::RETRY, vec![]),
         Command::Start => (v2::START, vec![]),

@@ -396,13 +396,17 @@ async fn apply(
     save_seq: &mut u32,
 ) -> Result<(), Error> {
     match action {
-        Action::Configure | Action::Retry => {
+        Action::Configure | Action::Clock | Action::Retry => {
             r.configured = false;
             engine(Engine::Pause).await?;
             while BLOCKS.try_receive().is_ok() {}
+            if action == Action::Clock && s != r.settings {
+                r.settings = s;
+                r.revision = r.revision.wrapping_add(1);
+            }
             let configured = with_timeout(
                 Duration::from_secs(4),
-                chip.configure_recovering(s.hardware(), s.controls),
+                chip.configure_recovering_clock(s.hardware(), s.controls, s.reference),
             )
             .await
             .map_err(|_| Error::Timeout)?;
@@ -423,6 +427,10 @@ async fn apply(
             )
             .await
             .map_err(|_| Error::Timeout)??;
+            r.commit(s, action);
+            engine(Engine::Update(*r)).await?;
+        }
+        Action::Logical => {
             r.commit(s, action);
             engine(Engine::Update(*r)).await?;
         }
@@ -612,6 +620,7 @@ async fn main(spawner: Spawner) {
                                 if matches!(
                                     action,
                                     Action::Configure
+                                        | Action::Clock
                                         | Action::Retry
                                         | Action::Capacitor
                                         | Action::Channel
@@ -639,6 +648,7 @@ async fn main(spawner: Spawner) {
                             && matches!(
                                 action,
                                 Action::Configure
+                                    | Action::Clock
                                     | Action::Retry
                                     | Action::Capacitor
                                     | Action::Channel

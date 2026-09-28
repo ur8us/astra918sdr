@@ -76,3 +76,8 @@ When the receiver is connected in the later session, confirm board variant,
 
 No firmware image has been hardware-qualified by the earlier reference
 projects’ results. The combined workload and composite USB device are new.
+
+The later [28 September hardware check](HARDWARE-2026-09-28.md) covers flash
+migration, clock/GPIO recovery, selected PLL lock points, and a short GNU Radio
+I/Q run. The sustained combined WSJT-X/SDR++ workload and native Windows/macOS
+checks above remain open.

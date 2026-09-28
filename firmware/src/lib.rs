@@ -13,7 +13,7 @@ pub mod protocol;
 pub mod recovery;
 pub mod wide_fir;
 pub const EXPERIMENTAL_MIN_HZ: u32 = 70_000;
-pub const EXPERIMENTAL_MAX_HZ: u32 = 130_000_000;
+pub const EXPERIMENTAL_MAX_HZ: u32 = 170_000_000;
 
 pub const RATES: [u32; 5] = [12_000, 24_000, 48_000, 96_000, 240_000];
 /// This transport mode uses the documented 100 kHz / 240 ksps CMX918 profile,
@@ -69,7 +69,8 @@ impl Config {
         if self.flags & !0x1ff != 0 || self.flags & 0xf0 != 0 && self.flags & XTAL_TRIM == 0 {
             return Err(Error::Protocol);
         }
-        if !self.frequency.is_multiple_of(100) || !(70_000..=130_000_000).contains(&self.frequency)
+        if !self.frequency.is_multiple_of(100)
+            || !(EXPERIMENTAL_MIN_HZ..=EXPERIMENTAL_MAX_HZ).contains(&self.frequency)
         {
             return Err(Error::Frequency);
         }
@@ -235,7 +236,14 @@ mod tests {
     #[test]
     fn frequency_boundaries_are_explicit() {
         assert_eq!(config().carrier(), [0x82, 0x2a, 0xb0]);
-        for frequency in [70_000, 100_000, 149_900, 108_000_100, 130_000_000] {
+        for frequency in [
+            70_000,
+            100_000,
+            149_900,
+            108_000_100,
+            130_000_000,
+            170_000_000,
+        ] {
             let c = Config {
                 frequency,
                 ..config()
@@ -243,7 +251,7 @@ mod tests {
             assert_eq!(c.validate(), Err(Error::Frequency));
             assert!(Config { flags: 3, ..c }.validate().is_ok());
         }
-        for frequency in [69_900, 130_000_100, 1_234_567, u32::MAX] {
+        for frequency in [69_900, 170_000_100, 1_234_567, u32::MAX] {
             assert!(
                 Config {
                     frequency,
