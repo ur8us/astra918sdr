@@ -103,9 +103,10 @@ build files. The board configuration assumes a 12 MHz MCU crystal and 4 MiB
 flash, reserving the final 8 KiB for settings. Confirm the board variant,
 flash capacity and inherited pinout before programming a different board.
 
-For automated builds, open the latest successful **Firmware UF2** run in
-GitHub Actions and download its `astra918-rp2350a-and-rp2350b-uf2` artifact.
-The ZIP contains an `astra918.uf2` file in each variant's directory.
+Download tagged firmware from [GitHub Releases](https://github.com/ur8us/astra918sdr/releases):
+`astra918-rp235xa.uf2` for RP2350A or `astra918-rp235xb.uf2` for RP2350B.
+Pushing a `v*` tag builds and publishes both files. Other builds remain
+available as a ZIP artifact of the **Firmware UF2** workflow in GitHub Actions.
 
 ## WSJT-X with the receiver
 
