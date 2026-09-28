@@ -13,7 +13,7 @@ pub mod protocol;
 pub mod recovery;
 pub mod wide_fir;
 pub const EXPERIMENTAL_MIN_HZ: u32 = 70_000;
-pub const EXPERIMENTAL_MAX_HZ: u32 = 170_000_000;
+pub const EXPERIMENTAL_MAX_HZ: u32 = 260_000_000;
 
 pub const RATES: [u32; 5] = [12_000, 24_000, 48_000, 96_000, 240_000];
 /// This transport mode uses the documented 100 kHz / 240 ksps CMX918 profile,
@@ -124,7 +124,10 @@ impl Config {
     }
 
     pub fn carrier(self) -> [u8; 3] {
-        let word = self.frequency / 100;
+        // Fc is a 21-bit value in 100 Hz units. Above that representable
+        // carrier, the manual PLL path uses explicit N/F/L coefficients.
+        // Keep Fc at its largest legal code instead of wrapping the field.
+        let word = self.frequency.min(209_715_100) / 100;
         // UM918/2.0 p.13: bit7=0 high-side LO; unlike the contradictory DS
         // prose, this agrees with trace-backed LF tuning. Use high-side below
         // 2 MHz, low-side elsewhere; 96 kHz IF in all included profiles.
@@ -243,6 +246,7 @@ mod tests {
             108_000_100,
             130_000_000,
             170_000_000,
+            260_000_000,
         ] {
             let c = Config {
                 frequency,
@@ -251,7 +255,7 @@ mod tests {
             assert_eq!(c.validate(), Err(Error::Frequency));
             assert!(Config { flags: 3, ..c }.validate().is_ok());
         }
-        for frequency in [69_900, 170_000_100, 1_234_567, u32::MAX] {
+        for frequency in [69_900, 260_000_100, 1_234_567, u32::MAX] {
             assert!(
                 Config {
                     frequency,
@@ -262,6 +266,15 @@ mod tests {
                 .is_err()
             );
         }
+        assert_eq!(
+            Config {
+                frequency: 260_000_000,
+                flags: 3,
+                ..config()
+            }
+            .carrier(),
+            [0x9f, 0xff, 0xff]
+        );
         assert_eq!(
             Config {
                 flags: 0,

@@ -207,13 +207,18 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
             self.write(0xd8, msb).await?;
             self.write(0xd9, lsb).await?; // LSB commits coefficient, no auto-increment
         }
-        let high_band = config.frequency > 130_000_000;
-        if high_band {
-            // Above the normal range, auto calculation can select L=3. This
-            // silicon cannot use L=3, so program the documented manual PLL
-            // formula with L=4 and a 96 kHz low-side IF instead.
+        let manual_divider = if config.frequency > 170_000_000 {
+            Some(2u16)
+        } else if config.frequency > 130_000_000 {
+            Some(3u16)
+        } else {
+            None
+        };
+        if let Some(divider) = manual_divider {
+            // Select the requested divider even when this silicon cannot lock
+            // it. The steps keep the VCO near the same operating frequency.
             let lo = u64::from(config.frequency - 96_000);
-            let scaled = (lo * 16 * (1 << 24) + 19_200_000) / 38_400_000;
+            let scaled = (lo * 4 * u64::from(divider) * (1 << 24) + 19_200_000) / 38_400_000;
             let n = (scaled >> 24) as u16;
             let f = (scaled & 0x00ff_ffff) as u32;
             self.write(0x2a, 1).await?; // manual L, fractional DSM
@@ -224,15 +229,16 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
                 (0x2e, (f >> 8) as u8),
                 (0x2f, f as u8),
                 (0x31, 0),
-                (0x32, 4),
+                (0x32, divider as u8),
             ] {
                 self.write(reg, value).await?;
             }
         }
         self.write(0x03, 3).await?;
-        self.write(0x29, if high_band { 6 } else { 5 }).await?;
+        self.write(0x29, if manual_divider.is_some() { 6 } else { 5 })
+            .await?;
         // Normal tuning: IF filter and automatic PLL/VCO calibration.
-        // High band: IF filter and VCO sub-band selection for manual L=4.
+        // High band: IF filter and VCO sub-band selection for the manual L.
         for attempt in 0..200 {
             if self.read(0x29).await? & 7 == 0 {
                 break;
@@ -254,10 +260,10 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
         if !locked {
             return Err(Error::Timeout);
         }
-        if high_band {
+        if let Some(expected) = manual_divider {
             let divider =
                 u16::from(self.read(0x33).await?) << 8 | u16::from(self.read(0x34).await?);
-            if divider != 4 {
+            if divider != expected {
                 return Err(Error::Timeout);
             }
         }
@@ -702,21 +708,21 @@ mod tests {
         });
     }
     #[test]
-    fn high_band_programs_manual_l_four() {
+    fn high_band_selects_requested_manual_divider() {
         futures::executor::block_on(async {
             let mut chip = Chip::new(Bus::new(), Delay);
             let high = Config {
-                frequency: 170_000_000,
+                frequency: 260_000_000,
                 flags: config().flags | crate::EXPERIMENTAL_RF,
                 ..config()
             };
             chip.configure(high).await.unwrap();
             assert_eq!(chip.bus.regs[0x2a], 1);
-            assert_eq!(chip.bus.regs[0x32], 4);
-            assert_eq!(chip.bus.regs[0x34], 4);
+            assert_eq!(chip.bus.regs[0x32], 2);
+            assert_eq!(chip.bus.regs[0x34], 2);
             assert!(chip.bus.writes.contains(&(0x29, 6)));
             let scaled =
-                (u64::from(high.frequency - 96_000) * 16 * (1 << 24) + 19_200_000) / 38_400_000;
+                (u64::from(high.frequency - 96_000) * 8 * (1 << 24) + 19_200_000) / 38_400_000;
             assert_eq!(chip.bus.regs[0x2c], (scaled >> 24) as u8);
             assert_eq!(chip.bus.regs[0x2f], scaled as u8);
         });

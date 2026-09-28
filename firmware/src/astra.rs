@@ -480,12 +480,12 @@ mod tests {
         let (s, action) = r.prepare(OFFSET, &1000i32.to_le_bytes()).unwrap();
         r.commit(s, action);
         let (s, action) = r
-            .prepare(v2::FREQUENCY_SET, &170_000_000u64.to_le_bytes())
+            .prepare(v2::FREQUENCY_SET, &260_000_000u64.to_le_bytes())
             .unwrap();
         r.commit(s, action);
-        assert_eq!(r.settings.center(), 169_999_000);
+        assert_eq!(r.settings.center(), 259_999_000);
         assert!(
-            r.prepare(v2::FREQUENCY_SET, &170_000_001u64.to_le_bytes())
+            r.prepare(v2::FREQUENCY_SET, &260_000_001u64.to_le_bytes())
                 .is_err()
         );
     }
