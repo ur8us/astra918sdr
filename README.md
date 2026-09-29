@@ -5,6 +5,11 @@ audio for WSJT-X. One USB connection exposes a 12 kHz mono recording device,
 a Kenwood-style CAT serial port, and 120 ksps signed 16-bit complex samples.
 Use WSJT-X alongside either the SDR++ source or the Rust controller.
 
+Hardware and software connections for the project are discussed in the
+[EEVblog forum thread](https://www.eevblog.com/forum/rf-microwave/astra918-cmx918rp2350-based-receiver-0-07-to-130-mhz/).
+
+![Astra918 receiver block diagram](images/astra918diagram.png)
+
 Keep these independent repositories adjacent:
 
 ```
