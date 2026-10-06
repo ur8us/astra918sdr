@@ -538,7 +538,7 @@ mod tests {
         r.fault(6);
         r.commit(s, action);
         assert_eq!(r.encode()[118], 1);
-        assert_eq!(r.encode()[120], 0xc0);
+        assert_eq!(r.encode()[120], 0xe0);
         assert!(r.configured);
         assert_eq!(r.error, 0);
         assert_eq!(r.generation, generation + 1);
