@@ -287,8 +287,8 @@ fn pty(state: State) -> Result<()> {
                 &mut master,
                 &mut slave,
                 name.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         } == 0,
         "openpty failed"
