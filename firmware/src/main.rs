@@ -406,7 +406,13 @@ async fn apply(
             }
             let configured = with_timeout(
                 Duration::from_secs(4),
-                chip.configure_recovering_clock(s.hardware(), s.controls, s.reference),
+                chip.configure_recovering_clock_with_if(
+                    s.hardware(),
+                    s.controls,
+                    s.reference,
+                    s.vfo_sign.lo_below(s.hardware().frequency),
+                    s.if_frequency.hz(),
+                ),
             )
             .await
             .map_err(|_| Error::Timeout)?;

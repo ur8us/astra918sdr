@@ -36,13 +36,16 @@ so clients can report and recover from the fault.
 | Center channel and retune | 39 | u64 dial Hz; sets dial and RF center atomically with offset zero |
 | Reference source | 3a | byte Internal=0, External=1; reconfigures CMX918 immediately |
 | Logical GPIO values | 3b | byte affected-bit mask, byte desired values; bit 0 is GPIO0 |
+| VFO sign | 3c | byte Auto=0, LO above signal=1, LO below signal=2 |
+| IF frequency | 3d | byte Auto=0 (96 kHz), 96 kHz=1, 120 kHz=2 |
 
 IDs above are hexadecimal. Setters normally reply with the complete status
 snapshot. Legacy arbitrary sample-rate/FIR/register/BOOTSEL commands are not
 part of this interface. Status codes: 0 OK, 1 command, 2 version, 3 length,
 4 argument, 5 unsupported, 6 busy, 7 spectrum bounds, 8 I/O, 9 PLL, 10 internal.
 Capabilities retain the inherited 204-byte layout; only rate slot zero (120000)
-is selectable. Status byte 120 bit 6 advertises reference selection and bit 7
+is selectable. Status byte 120 bit 5 advertises VFO sign and IF selection,
+bit 6 advertises reference selection and bit 7
 advertises the eight logical GPIO values. This leaves the capabilities reply
 compatible with existing clients. Do not mistake the inherited reserved rate
 slots for support.
@@ -81,11 +84,16 @@ The status payload is 128 bytes. Its authoritative fields are:
 | 100 / 104 / 108 | u32 each | Audio underruns / overruns / USB stalls |
 | 112 / 116 | u32 / u16 | Saved revision (ffffffff initially unsaved) / high edge |
 | 118 / 119 | u8 / u8 | Requested reference source / logical GPIO bitmask |
+| 120 / 121 / 122 | u8 / u8 / u8 | Feature bits / requested VFO sign / requested IF frequency |
 
 Other bytes are reserved. GPIO bits are receiver-owned state only; no physical
-RP2350 pins are assigned. Both settings apply immediately and only command 36
-persists them. Flash record format 2 reads format 1 with Internal reference and
-all GPIO bits cleared. The firmware state codecs in `firmware/src/astra.rs`
+RP2350 pins are assigned. All four settings apply immediately and only command 36
+persists them. Auto sign uses LO above below 2 MHz and LO below from 2 MHz;
+Auto IF uses 96 kHz. Forced LO below is rejected when the rounded center is at
+or below the selected IF. Sign/IF edits retune the same center and run the CMX918
+IF-filter and PLL calibration; the dial and audio offset are retained. Flash record
+format 3 reads formats 1 and 2, defaulting the new settings to Auto. Format 1
+also defaults to Internal reference and clears all GPIO bits. The firmware state codecs in `firmware/src/astra.rs`
 are normative. Gain tables and hardware constraints are in `controls.rs`.
 
 An I/Q record is 2112 bytes: a 64-byte `ASIQ` header followed by 512 interleaved

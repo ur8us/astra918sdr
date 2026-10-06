@@ -49,10 +49,31 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
     where
         I: crate::recovery::Recover,
     {
+        self.configure_recovering_clock_with_if(
+            config,
+            controls,
+            reference,
+            config.frequency >= 2_000_000,
+            96_000,
+        )
+        .await
+    }
+
+    pub async fn configure_recovering_clock_with_if(
+        &mut self,
+        config: Config,
+        controls: Controls,
+        reference: ReferenceClock,
+        lo_below: bool,
+        if_hz: u32,
+    ) -> Result<(), Error>
+    where
+        I: crate::recovery::Recover,
+    {
         config.validate()?;
         controls.validate(config)?;
         match self
-            .configure_controls_clock(config, controls, reference)
+            .configure_controls_clock_with_if(config, controls, reference, lo_below, if_hz)
             .await
         {
             Ok(()) => Ok(()),
@@ -67,7 +88,7 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
                 self.bus.recover().await.map_err(|_| Error::I2c)?;
                 self.reset().await?;
                 let result = self
-                    .configure_controls_clock(config, controls, reference)
+                    .configure_controls_clock_with_if(config, controls, reference, lo_below, if_hz)
                     .await;
                 #[cfg(target_arch = "arm")]
                 defmt::info!(
@@ -152,6 +173,24 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
         controls: Controls,
         reference: ReferenceClock,
     ) -> Result<(), Error> {
+        self.configure_controls_clock_with_if(
+            config,
+            controls,
+            reference,
+            config.frequency >= 2_000_000,
+            96_000,
+        )
+        .await
+    }
+
+    async fn configure_controls_clock_with_if(
+        &mut self,
+        config: Config,
+        controls: Controls,
+        reference: ReferenceClock,
+        lo_below: bool,
+        if_hz: u32,
+    ) -> Result<(), Error> {
         let config = config.validate()?;
         let controls = controls.validate(config)?;
         // Stop capture before entering this routine. Standby quiesces processing
@@ -184,7 +223,7 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
         ] {
             self.write(r, v).await?;
         }
-        let fc = config.carrier();
+        let fc = config.carrier_with(lo_below, if_hz);
         for (i, v) in fc.iter().enumerate() {
             self.write(0x08 + i as u8, *v).await?;
         }
@@ -217,7 +256,16 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
         if let Some(divider) = manual_divider {
             // Select the requested divider even when this silicon cannot lock
             // it. The steps keep the VCO near the same operating frequency.
-            let lo = u64::from(config.frequency - 96_000);
+            let lo = if lo_below {
+                u64::from(
+                    config
+                        .frequency
+                        .checked_sub(if_hz)
+                        .ok_or(Error::Frequency)?,
+                )
+            } else {
+                u64::from(config.frequency) + u64::from(if_hz)
+            };
             let scaled = (lo * 4 * u64::from(divider) * (1 << 24) + 19_200_000) / 38_400_000;
             let n = (scaled >> 24) as u16;
             let f = (scaled & 0x00ff_ffff) as u32;
@@ -269,7 +317,7 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
         }
         // Ported from cmx918audiocat 5e4d7d9 (MIT). DS p.28: writing Fc
         // alone does not execute PLL calculation. Preserve the calibrated PLL.
-        let routed_fc = controls.input.routing_carrier(config);
+        let routed_fc = controls.input.routing_carrier_with(config, fc);
         if routed_fc != fc {
             let mut pll = [0; 11];
             for (i, value) in pll.iter_mut().enumerate() {

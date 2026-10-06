@@ -43,6 +43,10 @@ impl RfInput {
     /// HF below 2 MHz was RF-tested in cmx918audiocat 5e4d7d9. The reverse
     /// override for forced LF is the same mechanism and requires RF validation.
     pub fn routing_carrier(self, config: Config) -> [u8; 3] {
+        self.routing_carrier_with(config, config.carrier())
+    }
+
+    pub fn routing_carrier_with(self, config: Config, original: [u8; 3]) -> [u8; 3] {
         let hz = match self.actual(config.frequency) {
             Self::Lf => config.frequency.min(1_999_900),
             Self::Hf | Self::Vhf => config.frequency.max(2_000_000),
@@ -53,7 +57,7 @@ impl RfInput {
             ..config
         }
         .carrier();
-        fc[0] = (fc[0] & 0x1f) | (config.carrier()[0] & 0xc0);
+        fc[0] = (fc[0] & 0x1f) | (original[0] & 0xc0);
         fc
     }
 }

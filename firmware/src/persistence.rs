@@ -1,6 +1,6 @@
 //! Two independent flash sectors; CRC and last-written commit page reject torn saves.
 use crate::{
-    astra::{Receiver, ReferenceClock, STATE_SIZE, Settings},
+    astra::{IfFrequency, Receiver, ReferenceClock, STATE_SIZE, Settings, VfoSign},
     cat::Mode,
     controls::{Controls, RfInput},
 };
@@ -21,7 +21,7 @@ pub fn crc32(data: &[u8]) -> u32 {
 pub fn record(settings: Settings, sequence: u32) -> [u8; PAGE] {
     let mut b = [0xff; PAGE];
     b[..4].copy_from_slice(b"ASNV");
-    b[4..8].copy_from_slice(&2u32.to_le_bytes());
+    b[4..8].copy_from_slice(&3u32.to_le_bytes());
     b[8..12].copy_from_slice(&sequence.to_le_bytes());
     let r = Receiver {
         settings,
@@ -40,7 +40,7 @@ pub fn commit_page(record: &[u8; PAGE]) -> [u8; PAGE] {
 }
 pub fn decode(b: &[u8; PAGE], commit: &[u8; PAGE]) -> Option<(Settings, u32)> {
     if &b[..4] != b"ASNV"
-        || !matches!(u32::from_le_bytes(b[4..8].try_into().ok()?), 1 | 2)
+        || !matches!(u32::from_le_bytes(b[4..8].try_into().ok()?), 1 | 2 | 3)
         || &commit[..4] != b"DONE"
         || commit[4..8] != b[252..]
         || crc32(&b[..252]).to_le_bytes() != b[252..]
@@ -78,6 +78,16 @@ pub fn decode(b: &[u8; PAGE], commit: &[u8; PAGE]) -> Option<(Settings, u32)> {
             ReferenceClock::parse(p[118]).ok()?
         },
         gpio: if version == 1 { 0 } else { p[119] },
+        vfo_sign: if version < 3 {
+            VfoSign::Auto
+        } else {
+            VfoSign::parse(p[121]).ok()?
+        },
+        if_frequency: if version < 3 {
+            IfFrequency::Auto
+        } else {
+            IfFrequency::parse(p[122]).ok()?
+        },
     };
     Some((
         s.validate().ok()?,
@@ -95,10 +105,27 @@ mod tests {
         let settings = Settings {
             reference: ReferenceClock::External,
             gpio: 0xa5,
+            vfo_sign: VfoSign::LoAbove,
+            if_frequency: IfFrequency::Khz120,
             ..Settings::default()
         };
         let next = record(settings, 7);
         assert_eq!(decode(&next, &commit_page(&next)), Some((settings, 7)));
+        let mut v2 = next;
+        v2[4..8].copy_from_slice(&2u32.to_le_bytes());
+        let crc = crc32(&v2[..252]);
+        v2[252..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            decode(&v2, &commit_page(&v2)),
+            Some((
+                Settings {
+                    vfo_sign: VfoSign::Auto,
+                    if_frequency: IfFrequency::Auto,
+                    ..settings
+                },
+                7
+            ))
+        );
         let mut old = record(Settings::default(), 6);
         old[4..8].copy_from_slice(&1u32.to_le_bytes());
         old[118 + 16] = 0xff;

@@ -124,15 +124,21 @@ impl Config {
     }
 
     pub fn carrier(self) -> [u8; 3] {
+        self.carrier_with(self.frequency >= 2_000_000, 96_000)
+    }
+
+    pub fn carrier_with(self, lo_below: bool, if_hz: u32) -> [u8; 3] {
         // Fc is a 21-bit value in 100 Hz units. Above that representable
         // carrier, the manual PLL path uses explicit N/F/L coefficients.
         // Keep Fc at its largest legal code instead of wrapping the field.
         let word = self.frequency.min(209_715_100) / 100;
         // UM918/2.0 p.13: bit7=0 high-side LO; unlike the contradictory DS
         // prose, this agrees with trace-backed LF tuning. Use high-side below
-        // 2 MHz, low-side elsewhere; 96 kHz IF in all included profiles.
+        // 2 MHz, low-side elsewhere in the default profile. Bit6 selects 120 kHz IF.
         [
-            (word >> 16) as u8 | if self.frequency >= 2_000_000 { 0x80 } else { 0 },
+            (word >> 16) as u8
+                | if lo_below { 0x80 } else { 0 }
+                | if if_hz == 120_000 { 0x40 } else { 0 },
             (word >> 8) as u8,
             word as u8,
         ]

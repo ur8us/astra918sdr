@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use astra918_firmware::{astra as a, control_v2 as v2};
 pub use astra918_firmware::{
-    astra::{Receiver, ReferenceClock, Settings},
+    astra::{IfFrequency, Receiver, ReferenceClock, Settings, VfoSign},
     cat::Mode,
     controls::{Controls, RfInput},
 };
@@ -178,6 +178,16 @@ pub fn decode(p: &[u8]) -> Result<Receiver> {
         reference: ReferenceClock::parse(p[118])
             .map_err(|_| anyhow::anyhow!("Invalid reference clock"))?,
         gpio: p[119],
+        vfo_sign: if p[120] & 0x20 != 0 {
+            VfoSign::parse(p[121]).map_err(|_| anyhow::anyhow!("Invalid VFO sign"))?
+        } else {
+            VfoSign::Auto
+        },
+        if_frequency: if p[120] & 0x20 != 0 {
+            IfFrequency::parse(p[122]).map_err(|_| anyhow::anyhow!("Invalid IF frequency"))?
+        } else {
+            IfFrequency::Auto
+        },
     };
     settings
         .validate()

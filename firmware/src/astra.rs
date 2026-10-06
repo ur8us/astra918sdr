@@ -23,6 +23,8 @@ pub const CHANNEL_TUNE: u8 = 0x38;
 pub const CENTER_TUNE: u8 = 0x39;
 pub const REFERENCE_SET: u8 = 0x3a;
 pub const GPIO_UPDATE: u8 = 0x3b;
+pub const VFO_SIGN_SET: u8 = 0x3c;
+pub const IF_FREQUENCY_SET: u8 = 0x3d;
 pub const STATE_SIZE: usize = 128;
 pub const IQ_HEADER: usize = 64;
 pub const IQ_SAMPLES: usize = 512;
@@ -47,6 +49,57 @@ impl ReferenceClock {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VfoSign {
+    #[default]
+    Auto = 0,
+    LoAbove = 1,
+    LoBelow = 2,
+}
+impl VfoSign {
+    pub fn parse(raw: u8) -> Result<Self, Status> {
+        match raw {
+            0 => Ok(Self::Auto),
+            1 => Ok(Self::LoAbove),
+            2 => Ok(Self::LoBelow),
+            _ => Err(Status::Argument),
+        }
+    }
+    pub fn lo_below(self, frequency: u32) -> bool {
+        match self {
+            Self::Auto => frequency >= 2_000_000,
+            Self::LoAbove => false,
+            Self::LoBelow => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum IfFrequency {
+    #[default]
+    Auto = 0,
+    Khz96 = 1,
+    Khz120 = 2,
+}
+impl IfFrequency {
+    pub fn parse(raw: u8) -> Result<Self, Status> {
+        match raw {
+            0 => Ok(Self::Auto),
+            1 => Ok(Self::Khz96),
+            2 => Ok(Self::Khz120),
+            _ => Err(Status::Argument),
+        }
+    }
+    pub fn hz(self) -> u32 {
+        match self {
+            Self::Auto | Self::Khz96 => 96_000,
+            Self::Khz120 => 120_000,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub dial: u64,
@@ -57,6 +110,8 @@ pub struct Settings {
     pub controls: Controls,
     pub reference: ReferenceClock,
     pub gpio: u8,
+    pub vfo_sign: VfoSign,
+    pub if_frequency: IfFrequency,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -69,6 +124,8 @@ impl Default for Settings {
             controls: Controls::default(),
             reference: ReferenceClock::Internal,
             gpio: 0,
+            vfo_sign: VfoSign::Auto,
+            if_frequency: IfFrequency::Auto,
         }
     }
 }
@@ -110,6 +167,10 @@ impl Settings {
         self.controls
             .validate(self.hardware())
             .map_err(|_| Status::Argument)?;
+        let frequency = self.hardware().frequency;
+        if self.vfo_sign.lo_below(frequency) && frequency <= self.if_frequency.hz() {
+            return Err(Status::Argument);
+        }
         Ok(self)
     }
     pub fn tuning(self) -> Tuning {
@@ -192,7 +253,7 @@ impl Receiver {
             | RETRY => 0,
             v2::FREQUENCY_SET | CHANNEL_TUNE | CENTER_TUNE => 8,
             OFFSET | AUDIO_FILTER | v2::RATE_SET | v2::OPTIONS => 4,
-            MODE | v2::INPUT_SET | REFERENCE_SET => 1,
+            MODE | v2::INPUT_SET | REFERENCE_SET | VFO_SIGN_SET | IF_FREQUENCY_SET => 1,
             v2::GAIN_MODE | v2::GAIN_SET | v2::LF_MF_CAPACITOR_SET | GPIO_UPDATE => 2,
             _ => return Err(Status::Command),
         };
@@ -226,6 +287,14 @@ impl Receiver {
             REFERENCE_SET => {
                 s.reference = ReferenceClock::parse(p[0])?;
                 Action::Clock
+            }
+            VFO_SIGN_SET => {
+                s.vfo_sign = VfoSign::parse(p[0])?;
+                Action::Configure
+            }
+            IF_FREQUENCY_SET => {
+                s.if_frequency = IfFrequency::parse(p[0])?;
+                Action::Configure
             }
             GPIO_UPDATE => {
                 s.gpio = (s.gpio & !p[0]) | (p[1] & p[0]);
@@ -340,7 +409,9 @@ impl Receiver {
         p[116..118].copy_from_slice(&s.high.to_le_bytes());
         p[118] = s.reference as u8;
         p[119] = s.gpio;
-        p[120] = 0xc0;
+        p[120] = 0xe0;
+        p[121] = s.vfo_sign as u8;
+        p[122] = s.if_frequency as u8;
         p
     }
     pub fn cat_prepare(&self, command: Command) -> Result<Option<(Settings, Action)>, Status> {
