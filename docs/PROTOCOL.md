@@ -121,6 +121,10 @@ dial, `FT0` reports VFO A, `PS1` reports the powered receiver, `KS020` is a
 fixed compatible keyer-speed value, and `SL` approximates the actual audio
 low cutoff in the Kenwood 00..20 range. `AI0`, `FR0`, `RX` are receive-only
 acknowledgements. `ZZST` reads health; `ZZRX` retries.
+Setting the CDC CAT interface's line coding to 1200 baud enters RP2350 BOOTSEL
+after the USB control transfer is acknowledged. This is a USB control request,
+not a CAT text command or AST1 command; it does not save settings. Picotool's
+`-f` vendor reset interface is not implemented.
 Unsupported or invalid commands return `?;`; successful setters return no
 text. Timeouts discard incomplete frames through their next delimiter. No TX
 command is implemented. FW reports width in Hz, supported by Hamlib’s custom

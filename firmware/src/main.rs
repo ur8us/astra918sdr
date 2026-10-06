@@ -41,6 +41,7 @@ use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embassy_usb::{
     Builder, Config, Handler,
     class::cdc_acm::{CdcAcmClass, State},
+    control::{OutResponse, Recipient, Request, RequestType},
     driver::{Endpoint, EndpointIn, EndpointOut},
 };
 use static_cell::StaticCell;
@@ -75,6 +76,7 @@ static READY: AtomicBool = AtomicBool::new(false);
 static STREAMING: AtomicBool = AtomicBool::new(false);
 static GENERATION: AtomicU32 = AtomicU32::new(0);
 static USB_EPOCH: AtomicU32 = AtomicU32::new(0);
+static BOOTSEL_REQUEST: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static USB_STALLS: AtomicU32 = AtomicU32::new(0);
 static IQ_FAULTS: AtomicU32 = AtomicU32::new(0);
 static IQ_DROPS: AtomicU32 = AtomicU32::new(0);
@@ -94,6 +96,22 @@ fn audio_active(active: bool) {
 }
 struct Events;
 impl Handler for Events {
+    fn control_out(&mut self, req: Request, data: &[u8]) -> Option<OutResponse> {
+        // CDC communication interface 2 follows UAC interfaces 0 and 1.
+        // Observe SET_LINE_CODING before the CDC handler consumes it, then let
+        // that handler acknowledge the request before rebooting.
+        if req.request_type == RequestType::Class
+            && req.recipient == Recipient::Interface
+            && req.index == 2
+            && req.request == 0x20
+            && req.length == 7
+            && data.len() == 7
+            && data[..4] == 1200u32.to_le_bytes()
+        {
+            BOOTSEL_REQUEST.signal(());
+        }
+        None
+    }
     fn reset(&mut self) {
         STREAMING.store(false, Ordering::Release);
     }
@@ -111,6 +129,14 @@ impl Handler for Events {
 #[embassy_executor::task]
 async fn usb_task(mut device: embassy_usb::UsbDevice<'static, UsbDriver>) {
     device.run().await;
+}
+#[embassy_executor::task]
+async fn bootsel_task() {
+    BOOTSEL_REQUEST.wait().await;
+    // The CDC handler still needs to complete the status stage of the control
+    // transfer. The ROM reset does not return on successful BOOTSEL entry.
+    Timer::after_millis(100).await;
+    embassy_rp::rom_data::reset_to_usb_boot(0, 0);
 }
 #[embassy_executor::task]
 async fn control_task(mut input: Out, mut output: In) {
@@ -558,11 +584,12 @@ async fn main(spawner: Spawner) {
         MSOS.init([0; 256]),
         CONTROL.init([0; 64]),
     );
+    builder.handler(EVENTS.init(Events));
     let audio = usb_audio::microphone(&mut builder, AUDIO_CONTROL.init(usb_audio::Control::new()));
     let cdc = CdcAcmClass::new(&mut builder, CDC.init(State::new()), 64);
     let (command, reply, iq) = usb_vendor::add(&mut builder);
-    builder.handler(EVENTS.init(Events));
     spawner.spawn(usb_task(builder.build()).unwrap());
+    spawner.spawn(bootsel_task().unwrap());
     spawner.spawn(audio_task(audio).unwrap());
     spawner.spawn(cat_task(cdc).unwrap());
     spawner.spawn(control_task(command, reply).unwrap());

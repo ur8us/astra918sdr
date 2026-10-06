@@ -107,6 +107,13 @@ hashes, source revision and whether the tree was dirty. These commands only
 build files. The board configuration assumes a 12 MHz MCU crystal and 4 MiB
 flash, reserving the final 8 KiB for settings. Confirm the board variant,
 flash capacity and inherited pinout before programming a different board.
+The CAT USB serial interface also enters RP2350 BOOTSEL when the host sets its
+line coding to 1200 baud. On Linux, for example, run
+`stty -F /dev/ttyACM0 1200`, wait for the RP2350 boot device to appear, then
+`picotool load -v artifacts/rp235xa/astra918.uf2` (use the matching variant).
+This does not write settings or implement picotool's `-f` reset interface.
+Close programs using the CAT port before changing its baud rate; CAT software
+configured for 1200 baud would trigger BOOTSEL as well.
 
 Download tagged firmware from [GitHub Releases](https://github.com/ur8us/astra918sdr/releases):
 `astra918-rp235xa.uf2` for RP2350A or `astra918-rp235xb.uf2` for RP2350B.
