@@ -1,14 +1,16 @@
-# Astra918
+# Astra918 transceiver
 
-RP2350 transceiver firmware combining CMX918 wideband I/Q with USB/LSB audio
-for WSJT-X. One USB connection exposes 12 kHz mono recording and playback,
+CMX918 + RP2350 (Raspberry Pi Pico 2) SDR transceiver firmware with wideband
+I/Q reception and audio-driven single-tone FSK transmission for applications
+such as WSJT-X. One USB connection exposes 12 kHz mono recording and playback,
 a Kenwood-style CAT serial port, and 120 ksps signed 16-bit complex samples.
 Use WSJT-X alongside either the SDR++ source or the Rust controller.
 
-Hardware and software connections for the project are discussed in the
-[EEVblog forum thread](https://www.eevblog.com/forum/rf-microwave/astra918-cmx918rp2350-based-receiver-0-07-to-130-mhz/).
+The [connection table](docs/TRX.md#connections) describes the CMX918/DRM-1000
+and Pico 2 wiring for reception and transmission. It matches the GPIO assignments
+in the [EEVblog hardware post](https://www.eevblog.com/forum/rf-microwave/astra918-cmx918rp2350-based-receiver-0-07-to-130-mhz/msg6368579/#msg6368579).
 
-![Astra918 receiver block diagram](images/astra918diagram.png)
+![Astra918 transceiver block diagram](images/astra918diagram.png)
 
 Keep these independent repositories adjacent:
 
@@ -17,8 +19,8 @@ astra918sdr/          firmware, shared state/DSP, simulator, CLI
 astra918sdr-gui/      Rust light-theme controls/status GUI
 ```
 
-The RP2350A firmware and both Linux applications have been tested with the
-physical receiver: on-air FT8, simultaneous SDR++/WSJT-X operation, bidirectional
+Receive-mode hardware checks with RP2350A firmware and both Linux applications
+cover on-air FT8 reception, simultaneous SDR++/WSJT-X operation, bidirectional
 tuning, controls, I/Q stall isolation, Save and incomplete-record recovery.
 Native Windows/macOS hardware checks remain pending. No frequency-generator
 tests are part of this project's acceptance procedure.
@@ -32,7 +34,7 @@ and offset +10,000 place the spectrum center at 14,064,000. CAT tuning to
 
 SDR++ Radio VFOs control local listening independently. Moving a VFO inside the
 waterfall leaves firmware audio untouched. Moving the waterfall center retunes
-the receiver and CAT dial while preserving the firmware audio offset. The GUI
+the transceiver and CAT dial while preserving the firmware audio offset. The GUI
 exposes this same spectrum-center tuning. Both applications' audio offset controls
 move the firmware channel and CAT dial inside the fixed RF spectrum using
 command 38. The complete USB/LSB passband must remain within that spectrum.
@@ -42,14 +44,14 @@ This center-based application update was compiled on Linux; runtime and hardware
 tests were not rerun, as requested. Earlier hardware reports describe the
 previous application tuning behavior.
 
-The receiver is authoritative. Clients read its current state when connecting;
+The transceiver is authoritative. Clients read its current state when connecting;
 they never restore an old frequency automatically. The entire USB/LSB audio
 passband must fit inside ±59.5 kHz. The 120 ksps spectrum has transition-band
 roll-off near its edges; this is not a promise of a flat 120 kHz RF passband.
-RF tuning limits are 70 kHz–130 MHz, subject to hardware qualification.
+Receive RF tuning limits are 70 kHz–130 MHz, subject to hardware qualification.
 
 Startup without saved settings is 14.2 MHz, USB, zero offset, 100–3500 Hz audio,
-AUTO input, RF/IF automatic gain. **Save to receiver** persists all current
+AUTO input, RF/IF automatic gain. **Save to transceiver** persists all current
 settings, including dial and offset. Ordinary edits never write flash. Saving
 briefly pauses reception; two alternating CRC-protected slots retain the older
 valid configuration if a write is interrupted.
@@ -58,7 +60,7 @@ valid configuration if a write is interrupted.
 
 Select Astra918's 12 kHz mono playback device in WSJT-X. Firmware tracks the
 audio tone and transmits at CAT dial plus the tone in USB or minus it in LSB.
-Enable transmit defaults on. The GUI exposes the RMS threshold, separate audio
+Enable transmit defaults on. The GUI exposes **Audio trigger level**, separate audio
 key/unkey delays, a 50 ms TX/RX relay delay and TX output configuration.
 Explicit Save persists these choices alongside the receiver and I/Q settings.
 
@@ -75,10 +77,10 @@ The combined integration has offline validation and RP2350A/B build coverage.
 Hardware qualification for the combined image is pending.
 The GUI's confirmed **Factory reset…** action erases both saved-settings slots
 and immediately restores the defaults above. It does not save a new record;
-**Save to receiver** is needed to persist later edits. The GUI keeps I/Q
+**Save to transceiver** is needed to persist later edits. The GUI keeps I/Q
 compensation controls visible but disables them if connected firmware does not
 advertise support. Flash matching firmware to enable them. The reset command was
-checked in the simulator; the destructive erase was not invoked on a receiver.
+checked in the simulator; the destructive erase was not invoked on a transceiver.
 
 ## I/Q compensation
 
@@ -111,7 +113,7 @@ The result appears in the status; the offline simulator reports calibration
 unavailable because it has no CMX918 pilot. This one-shot action is not saved.
 With automatic large-retune calibration off, a later RF reconfiguration clears
 the one-shot correction; run it again at the new tune if needed.
-The checkbox controls apply immediately; only **Save to receiver** writes them
+The checkbox controls apply immediately; only **Save to transceiver** writes them
 to flash. Calibration results themselves are not saved. On the connected RP2350A
 test board at 3.5 and 14.074 MHz, the manual command reported status 1 (complete),
 applied the CMX918's measured correction coefficients, turned off the pilot,
@@ -162,9 +164,9 @@ the default audio device. Its waterfall covers the generated 1500 Hz signal.
 
 Stop I/Q with the application's Play/Stop control, or `astra918ctl stop`,
 before reading or writing a register. The vendor interface permits one owner:
-close any SDR application holding the receiver before using these commands.
+close any SDR application holding the transceiver before using these commands.
 CAT and USB audio remain available while I/Q is stopped. With one connected
-receiver, the CLI and Python helpers select it automatically; use `--serial`
+transceiver, the CLI and Python helpers select it automatically; use `--serial`
 if several are connected.
 
 ```sh
@@ -183,7 +185,7 @@ an already built binary. Use `--simulator 127.0.0.1:7350` for offline practice.
 For CMX918 register `$07`, bit 1 enables the 19.2 MHz output on pin 8; bit 0
 selects crystal (`0`) or external TCXO (`1`). A raw write replaces the whole
 register byte, does not update saved settings, and may be overwritten by a
-later receiver reconfiguration. Pin 9 is not connected.
+later receiver reconfiguration. CMX918 pin 9 is unused in the documented wiring.
 
 ## Firmware images
 
@@ -215,7 +217,7 @@ must match their linker, clock and pin configuration.
 Pushing a `v*` tag builds and publishes this file. Other builds remain
 available as a ZIP artifact of the **Firmware UF2** workflow in GitHub Actions.
 
-## WSJT-X with the receiver
+## WSJT-X with the transceiver
 
 Select **Kenwood TS-480** or **Kenwood TS-570D**, its CDC serial port, 115200 baud, no handshake,
 PTT VOX, Split None, Poll 1 s, and Mode None (preserves the firmware mode chosen
@@ -224,7 +226,7 @@ Use the GUI's Enable transmit control to permit audio-triggered TX, then
 select a band in WSJT-X normally. See the [transceiver guide](docs/TRX.md).
 
 Use the OS audio mixer/device so WSJT-X’s 48 kHz capture request is resampled
-from the receiver’s 12 kHz UAC1 stream. On Linux use the PipeWire/PulseAudio
+from the transceiver’s 12 kHz UAC1 stream. On Linux use the PipeWire/PulseAudio
 source, rather than an ALSA `hw:` device that cannot resample. This physical
 path has been verified on Linux; native Windows/macOS checks remain pending.
 CAT setters acknowledge successful
@@ -237,5 +239,6 @@ retain their class drivers. If binding is needed, select **interface 4 only**.
 macOS uses its audio/CDC drivers and libusb for vendor access. Do not reset the
 whole USB configuration to connect a controller.
 
-Implementation details: [protocol](docs/PROTOCOL.md), [provenance](docs/PROVENANCE.md),
-[approved scope](docs/PLAN.md). Each host repository has its own build README.
+See the [USB protocol](docs/PROTOCOL.md) and
+[transceiver guide](docs/TRX.md) for implementation details.
+Each host repository has its own build README.

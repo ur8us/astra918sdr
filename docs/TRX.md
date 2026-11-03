@@ -12,14 +12,38 @@ single-tone FSK. Speech and simultaneous tones require a different modulator.
 
 ## Connections
 
-| RP2350 pin | Function |
-| --- | --- |
-| GP20 | CMX918 pin 8 LDIV input to the RP2350 clock divider |
-| GP21 | Normal divided RF output |
-| GP13 | Inverted RF output by default, selectable In-phase |
-| GP6 | External PTT, high during TX |
-| GP25 | Pico 2 onboard TX indicator |
-| GP2 | CMX918 RESETN, actively driven low then high |
+The current Pico 2 firmware uses the following connections. GPIO numbers refer
+to the RP2350 signals printed on the Pico 2 pinout. The DRM-1000 test-point
+assignments also appear in the
+[EEVblog hardware post](https://www.eevblog.com/forum/rf-microwave/astra918-cmx918rp2350-based-receiver-0-07-to-130-mhz/msg6368579/#msg6368579).
+
+| RP2350 pin | CMX918 / DRM-1000 connection | Function |
+| --- | --- | --- |
+| GP0 | CMX918 pin 17, SPI MOSI / I²C data, DRM-1000 TP4 | I²C SDA, bidirectional register control |
+| GP1 | CMX918 pin 18, SPI SCLK / I²C clock, DRM-1000 TP1 | I²C SCL, 400 kHz control clock |
+| GP8 | CMX918 pin 23, I2S_DATA / SDA, DRM-1000 TP11 | I/Q serial data input to Pico 2 |
+| GP9 | CMX918 pin 22, I2S_FRAME / CS, DRM-1000 TP10 | I/Q frame / SPI chip-select input to Pico 2 |
+| GP10 | CMX918 pin 24, I2S_SCLK, DRM-1000 TP9 | I/Q serial clock input to Pico 2 |
+| GP2 | CMX918 pin 14, RESETN | Chip reset, actively driven low then high |
+| GP20 | CMX918 pin 8, CLK_OUT / EXT_LO_IN | LDIV input to the RP2350 clock divider during TX |
+| GP21 | External RF circuit | Normal divided RF output |
+| GP13 | External RF circuit | Inverted RF output by default, selectable In-phase |
+| GP6 | External TX/RX relay or PTT circuit | PTT, high during TX |
+| GP25 | Pico 2 onboard LED | TX indicator |
+| GND | CMX918 / DRM-1000 GND and external circuit ground | Common ground |
+
+CMX918 controls the I/Q data clock and frame signals. Pico 2 captures these
+through PIO in SPI-slave format. Register control uses the separate I²C bus.
+
+For DRM-1000, hold the module's own processor RESET input low so its processor
+releases control of the CMX918. This is separate from CMX918 RESETN on pin 14,
+which connects to GP2. Feed the module's 3.3 V supply through a 3.3 V LDO whose
+input is Pico 2 VBUS (USB 5 V), as shown in the project block diagram.
+
+The CMX918-to-Pico clock link labelled VCO in the block diagram carries the
+L-divider output during transmission. The connections above match
+[main.rs](../firmware/src/main.rs), [capture.rs](../firmware/src/capture.rs)
+and [tx_output.rs](../firmware/src/tx_output.rs).
 
 GP13 and GP21 are low in RX. The output uses GPOUT0 with the GP20 input
 inverted. Differential mode inverts GP13 through its RP2350 OUTOVER field.
@@ -30,7 +54,7 @@ Both pins share the same clock divisor.
 | GUI control | Default | Range |
 | --- | --- | --- |
 | Enable transmit | Enabled | Enabled or disabled |
-| RMS trigger level | −40 dBFS | −60 to −6 dBFS |
+| Audio trigger level | −40 dBFS | −60 to −6 dBFS |
 | Audio key delay | 10 ms | 0–255 ms, minimum one 1 ms tick |
 | Audio unkey delay | 100 ms | 0–255 ms, minimum one 1 ms tick |
 | TX/RX Relay delay | 50 ms | 0–1000 ms |
