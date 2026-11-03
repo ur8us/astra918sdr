@@ -18,18 +18,21 @@ pub fn channel_error_micro_hz(offset: i32) -> i64 {
 }
 
 #[derive(Default)]
-struct Nco {
+pub(crate) struct Nco {
     phase: u32,
     increment: u32,
 }
 impl Nco {
-    fn new(hz: i64) -> Self {
+    pub(crate) fn new(hz: i64) -> Self {
         Self {
             phase: 0,
             increment: channel_increment(hz) as u32,
         }
     }
-    fn rotate(&mut self, i: f32, q: f32) -> (f32, f32) {
+    pub(crate) fn set_frequency(&mut self, hz: i64) {
+        self.increment = channel_increment(hz) as u32;
+    }
+    pub(crate) fn rotate(&mut self, i: f32, q: f32) -> (f32, f32) {
         if self.increment == 0 {
             return (i, q);
         }

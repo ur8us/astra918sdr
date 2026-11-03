@@ -120,6 +120,7 @@ class Acceptance(unittest.TestCase):
         self.client.command(0x46, bytes([8]))
         self.client.command(0x47, bytes([0]))
         self.client.command(0x48, bytes([1]))
+        self.client.command(0x4b, bytes([1]))
         self.client.command(0x20, struct.pack("<Q", 14074037))
         self.client.command(0x36)
         self.restart()
@@ -131,6 +132,7 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<H", state, 60)[0], 91)
         self.assertEqual(state[93], 8)
         self.assertEqual(state[127] & 160, 128)
+        self.assertEqual(state[64:69], b"TXIQ\x01")
         self.assertEqual(struct.unpack_from("<Q", state, 80)[0], 14074037)
         self.assertEqual(state[96:100], state[112:116])
         calibrated = self.client.command(0x42)
@@ -138,6 +140,7 @@ class Acceptance(unittest.TestCase):
         reset = self.client.command(0x3f)
         self.assertEqual(reset[62:64], bytes([1, 216]))
         self.assertEqual(reset[123], 1)
+        self.assertEqual(reset[64:69], b"TXIQ\x00")
         self.assertEqual(struct.unpack_from("<H", reset, 60)[0], 50)
         self.restart()
         self.assertEqual(self.client.command(0x13)[123], 1)
@@ -147,6 +150,40 @@ class Acceptance(unittest.TestCase):
         state=self.client.command(0x13);self.assertEqual(state[35],0)
         self.assertEqual(self.cat(b"FA;"),b"FA00014200000;")
         self.client.command(0x37);self.assertEqual(self.client.command(0x13)[35],1)
+    def test_tx_monitor_toggles_without_interrupting_iq(self):
+        import cmath
+        import math
+        self.client.command(0x33, struct.pack('<i', 10000))
+        self.client.command(0x34, bytes([1]))
+        with socket.create_connection(('127.0.0.1', self.port + 1), timeout=3) as iq:
+            self.client.command(0x30)
+            self.client.command(0x70, bytes([4]))
+            previous = None
+            for enabled in [True, False, True]:
+                self.client.command(0x4b, bytes([enabled]))
+                samples = []
+                for index in range(90):
+                    frame = exact(iq, 2112)
+                    counters = struct.unpack_from('<IIQ', frame, 8)
+                    if previous is not None:
+                        self.assertEqual(counters, (previous[0], previous[1] + 1, previous[2] + 512))
+                    previous = counters
+                    if index >= 66:
+                        samples.extend(complex(i, q) for i, q in struct.iter_unpack('<hh', frame[64:]))
+                if enabled:
+                    def level(frequency):
+                        return abs(sum(v * cmath.exp(-2j * math.pi * frequency * n / 120000)
+                                       for n, v in enumerate(samples))) / len(samples)
+                    wanted = level(8500)
+                    self.assertGreater(wanted, 5000)
+                    self.assertLess(level(11500), wanted / 50)
+                else:
+                    self.assertTrue(all(v == 0 for v in samples))
+                state = self.client.command(0x13)
+                self.assertEqual(state[34:36], bytes([1, 1]))
+                self.assertEqual(state[68], enabled)
+            self.client.command(0x70, bytes([0]))
+            self.assertEqual(self.client.command(0x13)[34:36], bytes([1, 1]))
     def test_only_one_vendor_owner(self):
         with contextlib.closing(Client(self.port)) as second:
             with self.assertRaises((EOFError,OSError)): second.command(0x13)

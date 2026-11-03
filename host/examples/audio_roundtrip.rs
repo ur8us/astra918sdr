@@ -1,10 +1,18 @@
 //! Offline PCM -> synthetic 120 ksps I/Q -> production DSP -> PCM.
 use anyhow::{Result, ensure};
-use astra918_firmware::{astra::Settings, cat::Mode, dsp::Demodulator};
+use astra918_firmware::{
+    astra::Settings,
+    cat::Mode,
+    dsp::Demodulator,
+    tx_monitor::{self, AudioBuffer, Monitor},
+};
 use std::{env, fs};
 fn main() -> Result<()> {
     let args: Vec<_> = env::args().collect();
-    ensure!(args.len() == 5, "input.wav output.wav offset USB|LSB");
+    ensure!(
+        args.len() == 5 || (args.len() == 6 && args[5] == "--tx-monitor"),
+        "input.wav output.wav offset USB|LSB [--tx-monitor]"
+    );
     let mut bytes = fs::read(&args[1])?;
     ensure!(
         &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
@@ -42,6 +50,12 @@ fn main() -> Result<()> {
     };
     ensure!(settings.validate().is_ok(), "Invalid settings");
     let mut dsp = Demodulator::new(settings);
+    if args.len() == 6 {
+        monitor_roundtrip(&mut bytes[start..start + len], settings, &mut dsp);
+        ensure!(dsp.clipped == 0, "Unexpected clipping");
+        fs::write(&args[2], bytes)?;
+        return Ok(());
+    }
     let carrier = settings.dial as f64 - f64::from(settings.hardware().frequency);
     let mut sample_index = 0;
     for at in (start..start + len).step_by(2) {
@@ -61,4 +75,46 @@ fn main() -> Result<()> {
     ensure!(dsp.clipped == 0, "Unexpected clipping");
     fs::write(&args[2], bytes)?;
     Ok(())
+}
+
+fn monitor_roundtrip(bytes: &mut [u8], settings: Settings, dsp: &mut Demodulator) {
+    let input: Vec<_> = bytes
+        .chunks_exact(2)
+        .map(|sample| i16::from_le_bytes(sample.try_into().unwrap()))
+        .collect();
+    let mut monitor = Monitor::default();
+    let mut queue = AudioBuffer::new();
+    let mut cursor = 0;
+    let mut written = 0;
+    while written < input.len() {
+        let (available, _) = queue.available();
+        for _ in available..64 {
+            queue.push(&[input.get(cursor).copied().unwrap_or(0)]);
+            cursor += 1;
+        }
+        let (available, discontinuity) = queue.available();
+        let needed = monitor.prepare(512, true, available, discontinuity);
+        let mut batch = [0; tx_monitor::MAX_INPUT];
+        queue.take(&mut batch[..needed]);
+        let mut frame = [0; 2048];
+        monitor.render(
+            &mut frame,
+            &batch[..needed],
+            tx_monitor::Config {
+                enabled: true,
+                offset: settings.offset,
+                mode: settings.mode,
+            },
+        );
+        for sample in frame.chunks_exact(4) {
+            let i = i16::from_le_bytes(sample[..2].try_into().unwrap());
+            let q = i16::from_le_bytes(sample[2..].try_into().unwrap());
+            if let (_, Some(audio)) = dsp.process(i, q)
+                && written < input.len()
+            {
+                bytes[written * 2..written * 2 + 2].copy_from_slice(&audio.to_le_bytes());
+                written += 1;
+            }
+        }
+    }
 }

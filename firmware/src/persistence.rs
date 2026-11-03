@@ -21,7 +21,7 @@ pub fn crc32(data: &[u8]) -> u32 {
 pub fn record(settings: Settings, sequence: u32) -> [u8; PAGE] {
     let mut b = [0xff; PAGE];
     b[..4].copy_from_slice(b"ASNV");
-    b[4..8].copy_from_slice(&9u32.to_le_bytes());
+    b[4..8].copy_from_slice(&10u32.to_le_bytes());
     b[8..12].copy_from_slice(&sequence.to_le_bytes());
     let r = Receiver {
         settings,
@@ -40,7 +40,7 @@ pub fn commit_page(record: &[u8; PAGE]) -> [u8; PAGE] {
 }
 pub fn decode(b: &[u8; PAGE], commit: &[u8; PAGE]) -> Option<(Settings, u32)> {
     if &b[..4] != b"ASNV"
-        || !matches!(u32::from_le_bytes(b[4..8].try_into().ok()?), 1..=9)
+        || !matches!(u32::from_le_bytes(b[4..8].try_into().ok()?), 1..=10)
         || &commit[..4] != b"DONE"
         || commit[4..8] != b[252..]
         || crc32(&b[..252]).to_le_bytes() != b[252..]
@@ -114,6 +114,14 @@ pub fn decode(b: &[u8; PAGE], commit: &[u8; PAGE]) -> Option<(Settings, u32)> {
         },
         tx_slew_fast: version < 6 || p[127] & crate::astra::TX_SLEW_FAST != 0,
         tx_differential: version < 7 || p[127] & crate::astra::TX_OUTPUTS_IN_PHASE == 0,
+        tx_iq_monitor: if version >= 10 {
+            if &p[64..68] != crate::astra::TX_IQ_STATUS_TAG || p[68] > 1 {
+                return None;
+            }
+            p[68] == 1
+        } else {
+            Settings::default().tx_iq_monitor
+        },
         running_iq: !has_iq || p[123] & 1 != 0,
         iq_on_large_retune: has_iq && p[123] & 2 != 0,
     };
@@ -131,6 +139,35 @@ pub fn newer(a: u32, b: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tx_iq_monitor_round_trips_and_older_settings_default_off() {
+        for enabled in [false, true] {
+            let settings = Settings {
+                tx_iq_monitor: enabled,
+                ..Default::default()
+            };
+            let record = record(settings, 23);
+            assert_eq!(decode(&record, &commit_page(&record)), Some((settings, 23)));
+            let mut old = record;
+            old[4..8].copy_from_slice(&9u32.to_le_bytes());
+            old[16 + 64..16 + 76].fill(0xff);
+            let crc = crc32(&old[..252]);
+            old[252..].copy_from_slice(&crc.to_le_bytes());
+            let (restored, _) = decode(&old, &commit_page(&old)).unwrap();
+            assert_eq!(
+                restored,
+                Settings {
+                    tx_iq_monitor: false,
+                    ..settings
+                }
+            );
+            let mut invalid = record;
+            invalid[16 + 68] = 2;
+            let crc = crc32(&invalid[..252]);
+            invalid[252..].copy_from_slice(&crc.to_le_bytes());
+            assert_eq!(decode(&invalid, &commit_page(&invalid)), None);
+        }
+    }
     #[test]
     fn iq_and_tx_version_four_records_migrate_independently() {
         let settings = Settings {

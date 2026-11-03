@@ -52,6 +52,7 @@ so clients can report and recover from the fault.
 | TX outputs | 48 | empty query returns one byte, setter accepts Differential=0 or In-phase=1 |
 | TX/RX Relay delay | 49 | empty query returns u16 milliseconds, setter accepts u16 0–1000, default 50 |
 | TX configuration | 4a | empty query or four bytes, enable 0/1, signed RMS dBFS, audio key ms, audio unkey ms |
+| Synthesize I/Q during transmit | 4b | empty query returns one byte, setter accepts disabled=0 or enabled=1 |
 
 IDs above are hexadecimal. Setters normally reply with the complete status
 snapshot. Raw register access requires I/Q to be stopped (status 6 otherwise),
@@ -100,7 +101,8 @@ The status payload is 128 bytes. Its authoritative fields are:
 | 40 / 44 / 48 / 52 | u32 each | I/Q drops / capture faults / USB faults / last error |
 | 56 / 57 / 58 | u8 / u8 / i16 | Chip status / valid / raw RSSI |
 | 60 / 62 / 63 | u16 / u8 / i8 | Relay delay ms / TX enable / TX RMS threshold dBFS, with byte 120 bit 4 |
-| 64–75 | bytes | Unknown inherited loss counters, all ff |
+| 64–67 / 68 | ASCII / u8 | `TXIQ` capability tag / TX I/Q synthesis enabled 0 or 1 |
+| 69–75 | bytes | Reserved inherited counters, all ff |
 | 76 / 78 / 79 | u16 / u8 / u8 | Capacitor / LF gain / LF attenuator |
 | 80 / 88 | u64 / i32 | Exact spectrum center / signed channel offset |
 | 92 / 94 | u8 / u16 | Audio mode / low edge |
@@ -113,6 +115,13 @@ The status payload is 128 bytes. Its authoritative fields are:
 | 123 / 124 | u8 / u8 | I/Q settings bits (same layout as command 3e) / pilot status: 0 never attempted, 1 complete, 2 unavailable or incomplete |
 | 125 / 126 | u8 / u8 | Audio key/unkey milliseconds |
 | 127 | u8 | Bit 0 TX support, 1 active TX, 2 tuning-error support, 3 drive support, 4 slew support, 5 Fast slew selected, 6 output-mode support, 7 In-phase selected |
+
+Bytes 64–67 contain the ASCII tag `TXIQ` when TX I/Q monitoring is supported.
+Byte 68 then contains its enable flag, 0 or 1. Older firmware uses the previous
+reserved/sentinel values there. Command `4b` with no payload returns the flag
+as one byte. A one-byte 0/1 payload changes it and returns the ordinary status
+snapshot. It applies during TX and is persisted only by Save. New devices,
+migration from older saved records and Factory reset all default to disabled.
 
 The combined layout retains command 3e and the I/Q fields at 123/124. TX
 configuration uses command 4a and bytes 62/63, 125/126. A TX-only legacy
@@ -180,8 +189,11 @@ previous interrupted transfer may leave a partial old frame in the USB FIFO.
 Reset the frame parser only after draining. Keep I/Q reads independent of
 control exchanges; a receiver reconfiguration can take longer than the I/Q
 backpressure deadline. Join the reader before Stop/drain or transport teardown.
-TX and RF recovery retain the requested USB stream with zero samples while
-capture is unavailable. A false configured flag alone does not end that stream.
+TX and RF recovery retain the requested USB stream while capture is unavailable.
+Samples default to zero. TX I/Q monitoring replaces those zeros with synthetic
+USB/LSB playback I/Q during audio-driven RF emission. It retains 120 ksps ci16,
+512 samples per frame and the existing timeline. A false configured flag alone
+does not end that stream.
 SDR++ keeps reading during control exchanges and discards its oldest decoded
 frames if its UI queue fills while waiting for matching generation metadata.
 Its control deadline is 15 seconds to cover the firmware's eight-second RF

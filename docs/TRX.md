@@ -61,6 +61,7 @@ Both pins share the same clock divisor.
 | TX outputs | Differential | Differential or In-phase |
 | TX outputs drive strength | 12 mA | 2, 4, 8 or 12 mA |
 | TX outputs edge rate | Fast | Slow or Fast |
+| Synthesize I/Q during transmit | Disabled | Enabled or disabled |
 
 Edits apply to the live transceiver. Explicit Save persists all current
 settings. The receiver's I/Q compensation policies are saved independently.
@@ -94,7 +95,21 @@ including the selected I/Q compensation policy. Recoverable TX faults use
 the same release sequence. A fatal firmware panic immediately mutes RF and
 releases PTT.
 
-Recording and I/Q deliver zero samples throughout TX and capture recovery.
+Recording delivers zero samples throughout TX and capture recovery. I/Q defaults
+to zeros during these periods. **Synthesize I/Q during transmit** enables a local
+monitor of 12 kHz playback audio during audio-driven RF transmission. A Hilbert
+filter selects the USB or LSB sideband, interpolation produces 120 ksps complex
+samples, and the firmware audio offset positions them within the I/Q spectrum.
+USB appears at offset plus audio frequency and LSB at offset minus audio frequency.
+The monitor follows RF enabling after the relay delay and fades over 1 ms at
+its boundaries. Its filter and playback buffer add approximately 17–21 ms latency
+before USB and host buffering.
+Sample amplitude follows playback with 6 dB digital headroom. This is a software
+view of playback and tuning. RF power and waveform quality require measurement
+at the RF output. Playback loss fades the monitor to zeros, and a bounded queue
+plus small resampling corrections handles playback/IQ timing differences.
+USB audio recording continues to use its receive path, avoiding a playback loop.
+
 The USB interfaces remain enumerated and I/Q sequence/sample counters remain
 contiguous within each generation. CAT remains available. The USB recording,
 CDC and vendor interface numbers retain their original assignments. Playback
@@ -130,6 +145,7 @@ The complete packet and status layouts are in [PROTOCOL.md](PROTOCOL.md).
 | TX edge rate | 47 | Empty query or one-byte slow=0/fast=1 setter |
 | TX outputs | 48 | Empty query or Differential=0/In-phase=1 setter |
 | Relay delay | 49 | Empty query or u16 milliseconds setter |
+| TX I/Q synthesis | 4B | Empty query returns one byte, or one-byte disabled=0/enabled=1 setter |
 
 Command `0x3E` retains the receiver I/Q compensation mask/value operation.
 Combined-layout status advertises byte 120 bit 4, reports TX enable and
@@ -137,9 +153,20 @@ threshold at bytes 62/63, and retains I/Q settings/status at 123/124.
 Audio key/unkey delays occupy 125/126 and relay delay occupies 60–61.
 The shared host decoder also accepts the earlier separate RX and TX layouts.
 
-Flash format 9 migrates receiver versions 1–4 and TX versions 4–8. Stored
+Status bytes 64–67 contain the ASCII tag `TXIQ` when synthesis is supported.
+Byte 68 holds its current setting as disabled=0/enabled=1. The GUI disables its
+checkbox when the tag is absent. The command applies immediately, including
+during TX. Explicit Save persists it.
+
+```sh
+target/release/astra918ctl tx-iq-monitor on
+target/release/astra918ctl save
+```
+
+Flash format 10 migrates receiver versions 1–4 and TX versions 4–9. Stored
 capabilities distinguish the two version-4 layouts. Existing TX selections
 are retained, and settings absent from older records receive their defaults.
+TX I/Q synthesis defaults off for older records and Factory reset.
 
 ## USB maintenance utilities
 

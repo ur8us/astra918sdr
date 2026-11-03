@@ -27,6 +27,10 @@ const CLK_GPOUT0_DIV: *mut u32 = 0x4001_0004 as *mut u32;
 const GP20_CTRL: *mut u32 = 0x4002_80A4 as *mut u32;
 const GP20_PAD: *mut u32 = 0x4003_8054 as *mut u32;
 
+pub(crate) fn rf_enabled() -> bool {
+    (unsafe { core::ptr::read_volatile(CLK_GPOUT0_CTRL) }) & (1 << 11) != 0
+}
+
 /// Update only GP13's live output override. RX and LDIV-only tests stay low.
 pub(crate) fn set_polarity(differential: bool) -> Result<(), astra918_firmware::Error> {
     critical_section::with(|_| {

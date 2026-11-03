@@ -15,11 +15,12 @@ use astra918_firmware::{
     Error,
     astra::{self as a, Action, Receiver, Settings},
     audio::{AudioQueue, MAX_PACKET_BYTES},
-    cat::{Command, Parser, Reply},
+    cat::{Command, Mode, Parser, Reply},
     chip::Chip,
     dsp::Demodulator,
     persistence as nv,
     tx_audio::Vox,
+    tx_monitor::{self, AudioBuffer as MonitorAudio, Monitor},
     tx_pll,
 };
 use core::{
@@ -71,6 +72,7 @@ async fn key_tx_relay(ptt: &mut Output<'_>, led: &mut Output<'_>, ms: u16) {
 }
 
 async fn unkey_tx_relay(ptt: &mut Output<'_>, led: &mut Output<'_>, ms: u16) {
+    TX_MONITOR_AUDIO_KEYED.store(false, Ordering::Release);
     let keyed = ptt.is_set_high();
     astra918_firmware::tx_relay::unkey(
         &mut embassy_time::Delay,
@@ -129,12 +131,32 @@ static IQ_FAULTS: AtomicU32 = AtomicU32::new(0);
 static IQ_DROPS: AtomicU32 = AtomicU32::new(0);
 static CAPTURE_ERROR: AtomicU32 = AtomicU32::new(0);
 static TX_ACTIVE: AtomicBool = AtomicBool::new(false);
-static IQ_STATE_HEADER: Mutex<CriticalSectionRawMutex, RefCell<[u8; a::IQ_HEADER]>> =
-    Mutex::new(RefCell::new([0; a::IQ_HEADER]));
+static TX_MONITOR_AUDIO_KEYED: AtomicBool = AtomicBool::new(false);
+struct IqState {
+    header: [u8; a::IQ_HEADER],
+    monitor: tx_monitor::Config,
+}
+static IQ_STATE_HEADER: Mutex<CriticalSectionRawMutex, RefCell<IqState>> =
+    Mutex::new(RefCell::new(IqState {
+        header: [0; a::IQ_HEADER],
+        monitor: tx_monitor::Config {
+            enabled: false,
+            offset: 0,
+            mode: Mode::Usb,
+        },
+    }));
+static TX_MONITOR_AUDIO: Mutex<CriticalSectionRawMutex, RefCell<MonitorAudio>> =
+    Mutex::new(RefCell::new(MonitorAudio::new()));
 
 fn publish_iq_state(radio: &Receiver) {
     IQ_STATE_HEADER.lock(|header| {
-        header.borrow_mut().copy_from_slice(&radio.iq_header(0, 0));
+        let mut state = header.borrow_mut();
+        state.header.copy_from_slice(&radio.iq_header(0, 0));
+        state.monitor = tx_monitor::Config {
+            enabled: radio.settings.tx_iq_monitor,
+            offset: radio.settings.offset,
+            mode: radio.settings.mode,
+        };
         GENERATION.store(radio.generation, Ordering::Release);
     });
 }
@@ -406,14 +428,41 @@ async fn playback_task(mut input: Out) {
                         *sample = i16::from_le_bytes([bytes[0], bytes[1]]);
                     }
                     estimator.push(&samples[..n / 2]);
-                    TX_AUDIO.signal(estimator.measure());
+                    let measurement = estimator.measure();
+                    TX_AUDIO.signal(measurement);
+                    let config = IQ_STATE_HEADER.lock(|state| state.borrow().monitor);
+                    let in_span = measurement.and_then(|m| m.frequency_hz).is_none_or(|tone| {
+                        let offset = config.offset as f32
+                            + if config.mode == Mode::Usb {
+                                tone
+                            } else {
+                                -tone
+                            };
+                        offset.abs() < 59_500.
+                    });
+                    TX_MONITOR_AUDIO.lock(|queue| {
+                        let mut queue = queue.borrow_mut();
+                        if config.enabled
+                            && in_span
+                            && STREAMING.load(Ordering::Acquire)
+                            && TX_ACTIVE.load(Ordering::Acquire)
+                            && TX_MONITOR_AUDIO_KEYED.load(Ordering::Acquire)
+                            && tx_output::rf_enabled()
+                        {
+                            queue.push(&samples[..n / 2]);
+                        } else {
+                            queue.clear();
+                        }
+                    });
                 }
                 Ok(Err(_)) => {
                     TX_AUDIO.signal(None);
+                    TX_MONITOR_AUDIO.lock(|queue| queue.borrow_mut().clear());
                     break;
                 }
                 _ => {
                     TX_AUDIO.signal(None);
+                    TX_MONITOR_AUDIO.lock(|queue| queue.borrow_mut().clear());
                     Timer::after_millis(1).await;
                 }
             }
@@ -423,6 +472,7 @@ async fn playback_task(mut input: Out) {
 #[embassy_executor::task]
 async fn iq_task(mut output: In) {
     let mut timeline = astra918_firmware::iq_stream::Timeline::default();
+    let mut monitor = Monitor::default();
     let period = Duration::from_micros(4_267);
     let mut next_fill = Instant::now() + period;
     loop {
@@ -439,8 +489,9 @@ async fn iq_task(mut output: In) {
                 if (TX_ACTIVE.load(Ordering::Acquire) || !READY.load(Ordering::Acquire))
                     && STREAMING.load(Ordering::Acquire) =>
             {
-                let frame = IQ_STATE_HEADER
-                    .lock(|header| astra918_firmware::iq_stream::zero_frame(&header.borrow()));
+                let frame = IQ_STATE_HEADER.lock(|header| {
+                    astra918_firmware::iq_stream::zero_frame(&header.borrow().header)
+                });
                 let generation = u32::from_le_bytes(frame[8..12].try_into().unwrap());
                 (frame, generation)
             }
@@ -450,7 +501,29 @@ async fn iq_task(mut output: In) {
             continue;
         }
         if TX_ACTIVE.load(Ordering::Acquire) || !READY.load(Ordering::Acquire) {
-            frame[a::IQ_HEADER..].fill(0);
+            let config = IQ_STATE_HEADER.lock(|state| state.borrow().monitor);
+            let active = config.enabled
+                && TX_ACTIVE.load(Ordering::Acquire)
+                && TX_MONITOR_AUDIO_KEYED.load(Ordering::Acquire)
+                && tx_output::rf_enabled();
+            let mut audio = [0i16; tx_monitor::MAX_INPUT];
+            let count = TX_MONITOR_AUDIO.lock(|queue| {
+                let mut queue = queue.borrow_mut();
+                if !active {
+                    queue.clear();
+                }
+                let (available, discontinuity) = queue.available();
+                let needed = monitor.prepare(a::IQ_SAMPLES, active, available, discontinuity);
+                queue.take(&mut audio[..needed])
+            });
+            let mut used = 0;
+            for chunk in frame[a::IQ_HEADER..].chunks_exact_mut(64 * 4) {
+                let end = (used + monitor.input_count(64)).min(count);
+                monitor.render(chunk, &audio[used..end], config);
+                used = end;
+                // Playback and the millisecond PLL controller share this core.
+                embassy_futures::yield_now().await;
+            }
         }
         // Capture and zero-fill are producers of the same USB stream. They
         // must never reset its counters independently within one generation.
@@ -1063,6 +1136,7 @@ async fn main(spawner: Spawner) {
                             }
                         };
                         unsafe { tx_divider_enable(plan.divider, radio.settings.tx_differential) };
+                        TX_MONITOR_AUDIO_KEYED.store(true, Ordering::Release);
                         publish_iq_state(&radio);
                         TX_ACTIVE.store(true, Ordering::Release);
                         tx_last_frequency = Some(fresh_rf);

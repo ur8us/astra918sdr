@@ -26,6 +26,9 @@ pub const GPIO_UPDATE: u8 = 0x3b;
 pub const VFO_SIGN_SET: u8 = 0x3c;
 pub const IF_FREQUENCY_SET: u8 = 0x3d;
 pub const TX_CONFIG: u8 = 0x4a;
+/// Empty query or one-byte setter for synthetic TX monitoring in the I/Q stream.
+pub const TX_IQ_MONITOR: u8 = 0x4b;
+pub const TX_IQ_STATUS_TAG: &[u8; 4] = b"TXIQ";
 /// Explicitly erase both saved-settings slots and restore default settings.
 pub const FACTORY_RESET: u8 = 0x3f;
 pub const FEATURE_FACTORY_RESET: u8 = 2;
@@ -151,6 +154,7 @@ pub struct Settings {
     pub tx_drive_ma: u8,
     pub tx_slew_fast: bool,
     pub tx_differential: bool,
+    pub tx_iq_monitor: bool,
     pub running_iq: bool,
     pub iq_on_large_retune: bool,
 }
@@ -175,6 +179,7 @@ impl Default for Settings {
             tx_drive_ma: 12,
             tx_slew_fast: true,
             tx_differential: true,
+            tx_iq_monitor: false,
             running_iq: true,
             iq_on_large_retune: false,
         }
@@ -309,6 +314,19 @@ impl Receiver {
             return Err(Status::Busy);
         }
         let mut s = self.settings;
+        if cmd == TX_IQ_MONITOR {
+            if p.is_empty() {
+                return Ok((s, Action::Query));
+            }
+            if p.len() != 1 {
+                return Err(Status::Length);
+            }
+            if p[0] > 1 {
+                return Err(Status::Argument);
+            }
+            s.tx_iq_monitor = p[0] == 1;
+            return Ok((s, Action::Logical));
+        }
         if cmd == TX_RELAY_DELAY {
             if p.is_empty() {
                 return Ok((s, Action::Query));
@@ -595,6 +613,8 @@ impl Receiver {
         p[62] = u8::from(s.tx_enabled);
         p[63] = s.tx_threshold_dbfs as u8;
         p[64..76].fill(0xff);
+        p[64..68].copy_from_slice(TX_IQ_STATUS_TAG);
+        p[68] = u8::from(s.tx_iq_monitor);
         p[80..88].copy_from_slice(&(s.center() as u64).to_le_bytes());
         p[88..92].copy_from_slice(&s.offset.to_le_bytes());
         p[92] = s.mode.digit() - b'0';
@@ -680,6 +700,9 @@ impl Receiver {
             TX_OUTPUTS if raw[12..14] == [0, 0] => {
                 reply(raw, status, &[u8::from(!self.settings.tx_differential)])
             }
+            TX_IQ_MONITOR if raw[12..14] == [0, 0] => {
+                reply(raw, status, &[u8::from(self.settings.tx_iq_monitor)])
+            }
             RX_TUNING_ERROR => match self.rx_tuning_error() {
                 Ok(value) => reply(raw, status, &value.to_le_bytes()),
                 Err(status) => reply(raw, status, &[]),
@@ -756,6 +779,43 @@ pub fn request(cmd: u8, seq: u32, payload: &[u8]) -> [u8; SIZE] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tx_iq_monitor_is_live_during_tx_and_saved_only_explicitly() {
+        let mut radio = Receiver {
+            configured: true,
+            streaming: true,
+            tx_active: true,
+            ..Default::default()
+        };
+        let original = radio.settings;
+        assert!(!original.tx_iq_monitor);
+        for enabled in [true, false, true] {
+            let saved = radio.saved_revision;
+            let (settings, action) = radio.prepare(TX_IQ_MONITOR, &[u8::from(enabled)]).unwrap();
+            assert_eq!(action, Action::Logical);
+            radio.commit(settings, action);
+            assert_eq!(
+                radio.settings,
+                Settings {
+                    tx_iq_monitor: enabled,
+                    ..original
+                }
+            );
+            assert_eq!(radio.saved_revision, saved);
+            assert!(radio.tx_active && radio.configured && radio.streaming);
+            let payload = radio.encode();
+            assert_eq!(&payload[64..68], TX_IQ_STATUS_TAG);
+            assert_eq!(payload[68], u8::from(enabled));
+            let query = request(TX_IQ_MONITOR, 1, &[]);
+            assert_eq!(radio.response(&query, Status::Ok)[16], u8::from(enabled));
+        }
+        assert_eq!(radio.prepare(TX_IQ_MONITOR, &[2]), Err(Status::Argument));
+        assert_eq!(radio.prepare(TX_IQ_MONITOR, &[1, 0]), Err(Status::Length));
+        radio.commit(radio.settings, Action::Save);
+        assert_eq!(radio.saved_revision, radio.revision);
+        radio.commit(Settings::default(), Action::FactoryReset);
+        assert!(!radio.settings.tx_iq_monitor);
+    }
     #[test]
     fn iq_and_tx_configuration_coexist_and_iq_operations_reject_active_tx() {
         let mut r = Receiver::default();

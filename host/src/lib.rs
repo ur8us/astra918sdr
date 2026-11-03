@@ -267,6 +267,7 @@ pub fn decode(p: &[u8]) -> Result<Receiver> {
         tx_slew_fast: p[127] & a::FEATURE_TX_SLEW == 0 || p[127] & a::TX_SLEW_FAST != 0,
         tx_differential: p[127] & a::FEATURE_TX_OUTPUTS == 0
             || p[127] & a::TX_OUTPUTS_IN_PHASE == 0,
+        tx_iq_monitor: &p[64..68] == a::TX_IQ_STATUS_TAG && p[68] == 1,
         running_iq: if has_iq { p[123] & 1 != 0 } else { true },
         iq_on_large_retune: has_iq && p[123] & 2 != 0,
     };
@@ -278,6 +279,10 @@ pub fn decode(p: &[u8]) -> Result<Receiver> {
         "Invalid state flags"
     );
     ensure!(!has_iq || p[123] & !3 == 0, "Invalid I/Q settings");
+    ensure!(
+        &p[64..68] != a::TX_IQ_STATUS_TAG || p[68] <= 1,
+        "Invalid TX I/Q monitor setting"
+    );
     ensure!(!has_iq || p[124] <= 2, "Invalid I/Q calibration status");
     Ok(Receiver {
         settings,

@@ -16,6 +16,7 @@ pub mod recovery;
 pub mod rx_pll;
 pub mod tx_audio;
 pub mod tx_control;
+pub mod tx_monitor;
 pub mod tx_pins;
 pub mod tx_pll;
 pub mod tx_relay;

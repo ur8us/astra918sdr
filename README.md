@@ -68,7 +68,13 @@ Connect CMX918 pin 8 to GP20. RF outputs are GP21 and GP13, with GP13 inverted
 in the default Differential mode. GP6 is active-high PTT. Firmware asserts PTT,
 waits the relay delay and enables RF. Returning to RX it mutes RF, waits the
 same delay and releases PTT. RX/TX transitions retain the USB devices and send
-zero recording/I/Q samples while reception is paused.
+zero recording samples while reception is paused. TX I/Q defaults to zeros.
+
+Enable **Synthesize I/Q during transmit** in the GUI to replace the TX I/Q zeros
+with a local monitor of USB playback audio. Its USB/LSB placement follows the
+CAT dial and firmware audio offset, so SDR applications can display and demodulate
+the transmitted audio. It defaults off, including when migrating older saved
+settings. **Save to transceiver** persists the choice.
 
 The [transceiver guide](docs/TRX.md) covers wiring, frequency planning, settings,
 the GUI's Test frequency toggle and USB-only maintenance utilities.

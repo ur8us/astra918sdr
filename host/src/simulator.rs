@@ -5,6 +5,7 @@ use astra918_firmware::{
     cat::{Parser, Reply},
     dsp::Demodulator,
     persistence as nv,
+    tx_monitor::{self, AudioBuffer as MonitorAudio, Monitor},
 };
 use clap::Parser as ArgsParser;
 use std::{
@@ -254,6 +255,8 @@ fn produce(
 ) {
     let mut previous = state.lock().unwrap().radio;
     let mut dsp = Demodulator::new(previous.settings);
+    let mut monitor = Monitor::default();
+    let mut monitor_audio = MonitorAudio::new();
     let mut sample = 0u64;
     let mut seq = 0u32;
     let mut started = Instant::now();
@@ -305,7 +308,35 @@ fn produce(
                 pcm.extend_from_slice(&(if receiving { v } else { 0 }).to_le_bytes());
             }
         }
-        // Device firmware keeps the USB timeline alive with zeros while RF
+        if r.tx_active && r.settings.tx_iq_monitor && r.streaming {
+            for index in sample / 10..(sample + 512) / 10 {
+                let audio_sample = wave.as_ref().map_or_else(
+                    || {
+                        (12000. * (std::f64::consts::TAU * 1500. * index as f64 / 12000.).cos())
+                            as i16
+                    },
+                    |wave| wave[((wave_origin + index) % wave.len() as u64) as usize],
+                );
+                monitor_audio.push(&[audio_sample]);
+            }
+            let (available, discontinuity) = monitor_audio.available();
+            let count = monitor.prepare(512, true, available, discontinuity);
+            let mut input = [0; tx_monitor::MAX_INPUT];
+            monitor_audio.take(&mut input[..count]);
+            monitor.render(
+                &mut frame[a::IQ_HEADER..],
+                &input[..count],
+                tx_monitor::Config {
+                    enabled: true,
+                    offset: r.settings.offset,
+                    mode: r.settings.mode,
+                },
+            );
+        } else {
+            monitor_audio.clear();
+            monitor.prepare(512, false, 0, false);
+        }
+        // Device firmware keeps the USB timeline alive while RF
         // hardware is unavailable, including TX/RX recovery.
         if r.streaming && !stall && iq.try_send(frame).is_err() {
             let mut s = state.lock().unwrap();

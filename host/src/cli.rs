@@ -36,6 +36,11 @@ enum Command {
         #[arg(value_parser=["differential", "in-phase"])]
         mode: Option<String>,
     },
+    /// Read or set synthetic I/Q monitoring of USB playback during TX.
+    TxIqMonitor {
+        #[arg(value_parser=["on", "off"])]
+        enabled: Option<String>,
+    },
     TxConfig {
         #[arg(value_parser=["on", "off"])]
         enabled: String,
@@ -168,6 +173,13 @@ fn main() -> Result<()> {
         ),
         Command::TuningError => (a::RX_TUNING_ERROR, vec![]),
         Command::TxDrive { ma } => (a::TX_DRIVE, ma.into_iter().collect()),
+        Command::TxIqMonitor { enabled } => (
+            a::TX_IQ_MONITOR,
+            enabled
+                .map(|value| u8::from(value == "on"))
+                .into_iter()
+                .collect(),
+        ),
         Command::TxRelayDelay { ms } => (
             a::TX_RELAY_DELAY,
             ms.map(|ms| ms.to_le_bytes().to_vec()).unwrap_or_default(),
@@ -255,7 +267,16 @@ fn main() -> Result<()> {
         }
         Err(error) => return Err(error),
     };
-    if cmd == a::TX_DRIVE && p.is_empty() {
+    if cmd == a::TX_IQ_MONITOR && p.is_empty() {
+        ensure!(
+            response.len() == 1 && response[0] <= 1,
+            "Invalid TX I/Q monitor reply"
+        );
+        println!(
+            "Synthesize I/Q during transmit {}",
+            if response[0] == 1 { "on" } else { "off" }
+        );
+    } else if cmd == a::TX_DRIVE && p.is_empty() {
         ensure!(
             response.len() == 1 && matches!(response[0], 2 | 4 | 8 | 12),
             "Invalid drive-strength reply"

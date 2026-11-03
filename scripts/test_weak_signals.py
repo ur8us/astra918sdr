@@ -76,17 +76,22 @@ def generate(mode):
 
 def main():
     p = argparse.ArgumentParser(); p.add_argument('--source',type=pathlib.Path,required=True)
+    p.add_argument('--tx-monitor', action='store_true', help='Pass playback through the TX I/Q monitor before receive DSP')
     args = p.parse_args(); OUT.mkdir(parents=True,exist_ok=True)
     build(args.source.resolve())
     run(['cargo','build','--release','-p','astra918-host','--example','audio_roundtrip'],cwd=ROOT)
     for mode in ['FT8','FT4','WSPR']:
         original = generate(mode)
         for sideband,offset in [('USB',45000),('LSB',-45000)]:
-            output = OUT/f'{mode}_{sideband}_000000.wav'
-            run([ROOT/'target/release/examples/audio_roundtrip',original,output,str(offset),sideband])
+            suffix = '_TXMONITOR' if args.tx_monitor else ''
+            output = OUT/f'{mode}_{sideband}{suffix}_000000.wav'
+            command = [ROOT/'target/release/examples/audio_roundtrip',original,output,str(offset),sideband]
+            if args.tx_monitor:
+                command.append('--tx-monitor')
+            run(command)
             command = ['wsprd','-f','14.0956',output] if mode=='WSPR' else ['jt9','-8' if mode=='FT8' else '-5',output]
             result = run(command,cwd=OUT,capture_output=True,text=True)
-            (OUT/f'{mode}_{sideband}.txt').write_text(result.stdout+result.stderr)
+            (OUT/f'{mode}_{sideband}{suffix}.txt').write_text(result.stdout+result.stderr)
             assert 'K1ABC' in result.stdout and 'FN42' in result.stdout, result.stdout+result.stderr
             print(f'{mode} {sideband} offset={offset}: decoded K1ABC FN42 through production DSP',flush=True)
 
