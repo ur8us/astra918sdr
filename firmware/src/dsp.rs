@@ -112,6 +112,8 @@ impl Demodulator {
     }
     /// Wide I/Q plus an audio sample every ten inputs. The PLL tunes the RF
     /// center directly; only the separate audio/CAT channel needs translation.
+    #[inline(never)]
+    #[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.rx_dsp"))]
     pub fn process(&mut self, i: i16, q: i16) -> ((i16, i16), Option<i16>) {
         let wide = (i, q);
         let channel = self.channel.rotate(f32::from(i), f32::from(q));

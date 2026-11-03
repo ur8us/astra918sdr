@@ -25,7 +25,10 @@ use astra918_firmware::{
 };
 use core::{
     cell::RefCell,
+    future::Future,
+    pin::Pin,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    task::{Context, Poll},
 };
 use defmt_rtt as _;
 use embassy_executor::{Executor, Spawner};
@@ -115,6 +118,9 @@ static ENGINE: Channel<CriticalSectionRawMutex, (u32, Engine), 1> = Channel::new
 static ENGINE_ACK: Channel<CriticalSectionRawMutex, (u32, Result<(), Error>), 1> = Channel::new();
 static ENGINE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static BLOCKS: Channel<CriticalSectionRawMutex, ([u8; a::IQ_FRAME], u32), 8> = Channel::new();
+// Core 1 prepares TX monitor frames ahead of the USB delivery deadline.
+static MONITOR_BLOCKS: Channel<CriticalSectionRawMutex, ([u8; a::IQ_FRAME], u32), 2> =
+    Channel::new();
 static AUDIO: Mutex<CriticalSectionRawMutex, RefCell<AudioQueue>> =
     Mutex::new(RefCell::new(AudioQueue::new()));
 static AUDIO_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -132,6 +138,9 @@ static IQ_DROPS: AtomicU32 = AtomicU32::new(0);
 static CAPTURE_ERROR: AtomicU32 = AtomicU32::new(0);
 static TX_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TX_MONITOR_AUDIO_KEYED: AtomicBool = AtomicBool::new(false);
+static PLAYBACK_SAMPLES: AtomicU32 = AtomicU32::new(0);
+static PLAYBACK_GAPS: AtomicU32 = AtomicU32::new(0);
+static MONITOR_READY: AtomicBool = AtomicBool::new(false);
 struct IqState {
     header: [u8; a::IQ_HEADER],
     monitor: tx_monitor::Config,
@@ -147,6 +156,14 @@ static IQ_STATE_HEADER: Mutex<CriticalSectionRawMutex, RefCell<IqState>> =
     }));
 static TX_MONITOR_AUDIO: Mutex<CriticalSectionRawMutex, RefCell<MonitorAudio>> =
     Mutex::new(RefCell::new(MonitorAudio::new()));
+
+fn monitor_active(config: tx_monitor::Config) -> bool {
+    config.enabled
+        && STREAMING.load(Ordering::Acquire)
+        && TX_ACTIVE.load(Ordering::Acquire)
+        && TX_MONITOR_AUDIO_KEYED.load(Ordering::Acquire)
+        && tx_output::rf_enabled()
+}
 
 fn publish_iq_state(radio: &Receiver) {
     IQ_STATE_HEADER.lock(|header| {
@@ -423,6 +440,7 @@ async fn playback_task(mut input: Out) {
             let mut packet = [0u8; 26];
             match with_timeout(Duration::from_millis(10), input.read(&mut packet)).await {
                 Ok(Ok(n)) if n > 0 && n % 2 == 0 => {
+                    PLAYBACK_SAMPLES.fetch_add((n / 2) as u32, Ordering::Relaxed);
                     let mut samples = [0i16; 13];
                     for (sample, bytes) in samples.iter_mut().zip(packet[..n].chunks_exact(2)) {
                         *sample = i16::from_le_bytes([bytes[0], bytes[1]]);
@@ -442,13 +460,7 @@ async fn playback_task(mut input: Out) {
                     });
                     TX_MONITOR_AUDIO.lock(|queue| {
                         let mut queue = queue.borrow_mut();
-                        if config.enabled
-                            && in_span
-                            && STREAMING.load(Ordering::Acquire)
-                            && TX_ACTIVE.load(Ordering::Acquire)
-                            && TX_MONITOR_AUDIO_KEYED.load(Ordering::Acquire)
-                            && tx_output::rf_enabled()
-                        {
+                        if in_span && monitor_active(config) {
                             queue.push(&samples[..n / 2]);
                         } else {
                             queue.clear();
@@ -461,6 +473,7 @@ async fn playback_task(mut input: Out) {
                     break;
                 }
                 _ => {
+                    PLAYBACK_GAPS.fetch_add(1, Ordering::Relaxed);
                     TX_AUDIO.signal(None);
                     TX_MONITOR_AUDIO.lock(|queue| queue.borrow_mut().clear());
                     Timer::after_millis(1).await;
@@ -469,77 +482,169 @@ async fn playback_task(mut input: Out) {
         }
     }
 }
+// Keep bulk packet servicing independent of shared flash-cache pressure.
+struct RamFuture<F>(F);
+impl<F: Future> Future for RamFuture<F> {
+    type Output = F::Output;
+    #[inline(never)]
+    #[unsafe(link_section = ".data.usb_iq")]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // The inner future is never moved while this wrapper is pinned.
+        unsafe { self.map_unchecked_mut(|this| &mut this.0) }.poll(cx)
+    }
+}
+
 #[embassy_executor::task]
-async fn iq_task(mut output: In) {
-    let mut timeline = astra918_firmware::iq_stream::Timeline::default();
-    let mut monitor = Monitor::default();
-    let period = Duration::from_micros(4_267);
-    let mut next_fill = Instant::now() + period;
-    loop {
-        let item = select(BLOCKS.receive(), Timer::at(next_fill)).await;
-        if matches!(&item, Either::Second(())) {
-            next_fill += period;
-            if next_fill <= Instant::now() {
+fn iq_task(mut output: In) -> impl Future<Output = ()> {
+    RamFuture(async move {
+        let mut timeline = astra918_firmware::iq_stream::Timeline::default();
+        let period = Duration::from_micros(4_267);
+        let mut next_fill = Instant::now() + period;
+        loop {
+            let config = IQ_STATE_HEADER.lock(|state| state.borrow().monitor);
+            let prepared = if monitor_active(config) {
+                // The DSP producer already clocks these frames. Consume them as
+                // soon as USB is ready, allowing bulk scheduling jitter to settle.
+                with_timeout(Duration::from_millis(10), MONITOR_BLOCKS.receive())
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            let (mut frame, generation, synthesized) = if let Some((frame, generation)) = prepared {
+                if !monitor_active(config)
+                    || !IQ_STATE_HEADER.lock(|state| frame[48..52] == state.borrow().header[48..52])
+                {
+                    continue;
+                }
                 next_fill = Instant::now() + period;
+                (frame, generation, true)
+            } else {
+                let item = select(BLOCKS.receive(), Timer::at(next_fill)).await;
+                if matches!(&item, Either::Second(())) {
+                    next_fill += period;
+                    if next_fill + Duration::from_millis(100) <= Instant::now() {
+                        next_fill = Instant::now() + period;
+                    }
+                }
+                match item {
+                    Either::First((frame, generation)) => (frame, generation, false),
+                    Either::Second(())
+                        if (TX_ACTIVE.load(Ordering::Acquire)
+                            || !READY.load(Ordering::Acquire))
+                            && STREAMING.load(Ordering::Acquire) =>
+                    {
+                        let frame = IQ_STATE_HEADER.lock(|state| {
+                            astra918_firmware::iq_stream::zero_frame(&state.borrow().header)
+                        });
+                        let generation = u32::from_le_bytes(frame[8..12].try_into().unwrap());
+                        (frame, generation, false)
+                    }
+                    Either::Second(()) => continue,
+                }
+            };
+            if !STREAMING.load(Ordering::Acquire)
+                || generation != GENERATION.load(Ordering::Acquire)
+            {
+                continue;
+            }
+            if !synthesized && (TX_ACTIVE.load(Ordering::Acquire) || !READY.load(Ordering::Acquire))
+            {
+                frame[a::IQ_HEADER..].fill(0);
+            }
+            // Capture and zero-fill are producers of the same USB stream. They
+            // must never reset its counters independently within one generation.
+            timeline.stamp(&mut frame);
+            let transfer = async {
+                for packet in frame.chunks(64) {
+                    output.write(packet).await?;
+                }
+                Ok::<(), embassy_usb::driver::EndpointError>(())
+            };
+            if !matches!(
+                with_timeout(Duration::from_millis(100), transfer).await,
+                Ok(Ok(()))
+            ) {
+                increment(&IQ_FAULTS);
+                STREAMING.store(false, Ordering::Release);
             }
         }
-        let (mut frame, generation) = match item {
-            Either::First(frame) => frame,
-            Either::Second(())
-                if (TX_ACTIVE.load(Ordering::Acquire) || !READY.load(Ordering::Acquire))
-                    && STREAMING.load(Ordering::Acquire) =>
-            {
-                let frame = IQ_STATE_HEADER.lock(|header| {
-                    astra918_firmware::iq_stream::zero_frame(&header.borrow().header)
-                });
-                let generation = u32::from_le_bytes(frame[8..12].try_into().unwrap());
-                (frame, generation)
-            }
-            Either::Second(()) => continue,
-        };
-        if !STREAMING.load(Ordering::Acquire) || generation != GENERATION.load(Ordering::Acquire) {
+    })
+}
+#[embassy_executor::task]
+async fn monitor_task() {
+    let mut monitor = Monitor::default();
+    MONITOR_READY.store(true, Ordering::Release);
+    let period = Duration::from_micros(4_267);
+    let mut next = Instant::now();
+    let mut report = Instant::now();
+    let mut last_samples = 0;
+    let mut last_gaps = 0;
+    let mut frames = 0;
+    let mut empty = 0;
+    let mut render_us = 0;
+    let mut max_us = 0;
+    loop {
+        next += period;
+        Timer::at(next).await;
+        if next + period <= Instant::now() {
+            next = Instant::now();
+        }
+        let config = IQ_STATE_HEADER.lock(|state| state.borrow().monitor);
+        let active = monitor_active(config);
+        if !active {
+            monitor.prepare(a::IQ_SAMPLES, false, 0, false);
+            TX_MONITOR_AUDIO.lock(|queue| queue.borrow_mut().clear());
+            report = Instant::now();
+            last_samples = PLAYBACK_SAMPLES.load(Ordering::Relaxed);
+            last_gaps = PLAYBACK_GAPS.load(Ordering::Relaxed);
+            frames = 0;
+            empty = 0;
+            render_us = 0;
+            max_us = 0;
+            while MONITOR_BLOCKS.try_receive().is_ok() {}
             continue;
         }
-        if TX_ACTIVE.load(Ordering::Acquire) || !READY.load(Ordering::Acquire) {
-            let config = IQ_STATE_HEADER.lock(|state| state.borrow().monitor);
-            let active = config.enabled
-                && TX_ACTIVE.load(Ordering::Acquire)
-                && TX_MONITOR_AUDIO_KEYED.load(Ordering::Acquire)
-                && tx_output::rf_enabled();
-            let mut audio = [0i16; tx_monitor::MAX_INPUT];
-            let count = TX_MONITOR_AUDIO.lock(|queue| {
-                let mut queue = queue.borrow_mut();
-                if !active {
-                    queue.clear();
-                }
-                let (available, discontinuity) = queue.available();
-                let needed = monitor.prepare(a::IQ_SAMPLES, active, available, discontinuity);
-                queue.take(&mut audio[..needed])
-            });
-            let mut used = 0;
-            for chunk in frame[a::IQ_HEADER..].chunks_exact_mut(64 * 4) {
-                let end = (used + monitor.input_count(64)).min(count);
-                monitor.render(chunk, &audio[used..end], config);
-                used = end;
-                // Playback and the millisecond PLL controller share this core.
-                embassy_futures::yield_now().await;
-            }
+        let header = IQ_STATE_HEADER.lock(|state| state.borrow().header);
+        let mut frame = astra918_firmware::iq_stream::zero_frame(&header);
+        let mut audio = [0i16; tx_monitor::MAX_INPUT];
+        let count = TX_MONITOR_AUDIO.lock(|queue| {
+            let mut queue = queue.borrow_mut();
+            let (available, discontinuity) = queue.available();
+            let needed = monitor.prepare(a::IQ_SAMPLES, active, available, discontinuity);
+            queue.take(&mut audio[..needed])
+        });
+        let render_start = Instant::now();
+        monitor.render(&mut frame[a::IQ_HEADER..], &audio[..count], config);
+        let elapsed = render_start.elapsed().as_micros();
+        render_us += elapsed;
+        max_us = max_us.max(elapsed);
+        frames += 1;
+        empty += u32::from(count == 0);
+        let generation = u32::from_le_bytes(frame[8..12].try_into().unwrap());
+        if MONITOR_BLOCKS.try_send((frame, generation)).is_err() {
+            increment(&IQ_DROPS);
         }
-        // Capture and zero-fill are producers of the same USB stream. They
-        // must never reset its counters independently within one generation.
-        timeline.stamp(&mut frame);
-        let transfer = async {
-            for packet in frame.chunks(64) {
-                output.write(packet).await?;
-            }
-            Ok::<(), embassy_usb::driver::EndpointError>(())
-        };
-        if !matches!(
-            with_timeout(Duration::from_millis(100), transfer).await,
-            Ok(Ok(()))
-        ) {
-            increment(&IQ_FAULTS);
-            STREAMING.store(false, Ordering::Release);
+        if frames == 128 {
+            let samples = PLAYBACK_SAMPLES.load(Ordering::Relaxed);
+            let gaps = PLAYBACK_GAPS.load(Ordering::Relaxed);
+            defmt::info!(
+                "TX monitor interval_us={} frames={} empty={} pcm={} gaps={} render_mean_us={} render_max_us={}",
+                report.elapsed().as_micros(),
+                frames,
+                empty,
+                samples.wrapping_sub(last_samples),
+                gaps.wrapping_sub(last_gaps),
+                render_us / 128,
+                max_us
+            );
+            report = Instant::now();
+            last_samples = samples;
+            last_gaps = gaps;
+            frames = 0;
+            empty = 0;
+            render_us = 0;
+            max_us = 0;
         }
     }
 }
@@ -970,25 +1075,38 @@ async fn main(spawner: Spawner) {
     static EXECUTOR: StaticCell<Executor> = StaticCell::new();
     let capture = capture::Capture::new(p.PIO0, p.DMA_CH0, p.PIN_8, p.PIN_9, p.PIN_10, Irqs);
     spawn_core1(p.CORE1, STACK.init(Stack::new()), move || {
-        EXECUTOR
-            .init(Executor::new())
-            .run(|spawner| spawner.spawn(engine_task(capture).unwrap()));
+        EXECUTOR.init(Executor::new()).run(|spawner| {
+            spawner.spawn(engine_task(capture).unwrap());
+            spawner.spawn(monitor_task().unwrap());
+        });
     });
     let mut chip = Chip::new(
         i2c_bus::Bus::new(p.I2C0, p.PIN_1, p.PIN_0),
         embassy_time::Delay,
     );
     let settings = radio.settings;
-    if let Err(e) = apply(
-        &mut radio,
-        settings,
-        Action::Configure,
-        &mut chip,
-        &mut flash,
-        &mut save_seq,
-    )
-    .await
-    {
+    let startup = async {
+        // Coefficient preparation is a one-time core-1 workload. Complete it
+        // before starting capture operations with their 500 ms ACK deadline.
+        with_timeout(Duration::from_secs(2), async {
+            while !MONITOR_READY.load(Ordering::Acquire) {
+                Timer::after_millis(1).await;
+            }
+        })
+        .await
+        .map_err(|_| Error::Timeout)?;
+        apply(
+            &mut radio,
+            settings,
+            Action::Configure,
+            &mut chip,
+            &mut flash,
+            &mut save_seq,
+        )
+        .await
+    }
+    .await;
+    if let Err(e) = startup {
         radio.fault(e as u32);
     }
     let mut last_status = Instant::now();

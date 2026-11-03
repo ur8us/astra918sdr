@@ -102,13 +102,33 @@ filter selects the USB or LSB sideband, interpolation produces 120 ksps complex
 samples, and the firmware audio offset positions them within the I/Q spectrum.
 USB appears at offset plus audio frequency and LSB at offset minus audio frequency.
 The monitor follows RF enabling after the relay delay and fades over 1 ms at
-its boundaries. Its filter and playback buffer add approximately 17–21 ms latency
-before USB and host buffering.
+its boundaries. The filters add approximately 12 ms latency, with additional
+delay from playback, prepared-frame and USB/host buffering.
 Sample amplitude follows playback with 6 dB digital headroom. This is a software
 view of playback and tuning. RF power and waveform quality require measurement
 at the RF output. Playback loss fades the monitor to zeros, and a bounded queue
 plus small resampling corrections handles playback/IQ timing differences.
 USB audio recording continues to use its receive path, avoiding a playback loop.
+Synthesis runs on the RP2350's second core and prepares frames at 120 ksps.
+USB consumes these frames as bandwidth becomes available. Fixed-point
+interpolation and RAM-resident DSP and bulk-transfer code keep playback,
+recording, I/Q and PLL control within their processing deadlines.
+
+For an explicit Linux/PipeWire hardware check, enable transmit and synthesis, then play a
+12 kHz mono PCM16 digital-mode WAV through the normal USB playback device.
+The following test measures I/Q delivery rate, sample continuity and amplitude,
+and checks that RX recovers after playback. It uses the current CAT frequency.
+
+```sh
+python3 scripts/test_tx_monitor_hardware.py --run --wav /path/to/transmit.wav
+```
+
+The Pico 2 hardware check exercised recording, playback, control and I/Q
+together. It delivered approximately 120 ksps with continuous counters, steady
+monitor amplitude, zero silent frames during sustained TX and healthy RX recovery.
+Captured monitor I/Q decoded the FT8 message `CQ UR8US KO50` using WSJT-X `jt9`.
+Offline round trips through the monitor and receive DSP decoded FT8 and FT4
+in both USB and LSB.
 
 The USB interfaces remain enumerated and I/Q sequence/sample counters remain
 contiguous within each generation. CAT remains available. The USB recording,

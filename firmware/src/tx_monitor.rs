@@ -5,7 +5,7 @@ const AUDIO_CAPACITY: usize = 256;
 const PREFILL: usize = 64;
 const HILBERT_TAPS: usize = 255;
 const INTERP_TAPS: usize = 32;
-const PHASES: usize = 10;
+const PHASES: usize = 256;
 const SCALE: u64 = 1 << 32;
 const FADE_SAMPLES: f32 = 120.;
 pub const MAX_INPUT: usize = 54;
@@ -79,8 +79,8 @@ pub struct Monitor {
     hilbert_coeff: [f32; 64],
     history: [f32; HILBERT_TAPS * 2],
     head: usize,
-    interp_coeff: [[f32; INTERP_TAPS]; PHASES + 1],
-    analytic: [(f32, f32); INTERP_TAPS * 2],
+    interp_coeff: [[i16; INTERP_TAPS]; PHASES + 1],
+    analytic: [(i16, i16); INTERP_TAPS * 2],
     analytic_head: usize,
     phase: u32,
     step: u32,
@@ -104,8 +104,8 @@ impl Default for Monitor {
             hilbert_coeff: [0.; 64],
             history: [0.; HILBERT_TAPS * 2],
             head: 0,
-            interp_coeff: [[0.; INTERP_TAPS]; PHASES + 1],
-            analytic: [(0., 0.); INTERP_TAPS * 2],
+            interp_coeff: [[0; INTERP_TAPS]; PHASES + 1],
+            analytic: [(0, 0); INTERP_TAPS * 2],
             analytic_head: 0,
             phase: 0,
             step: (SCALE / 10) as u32,
@@ -121,8 +121,9 @@ impl Default for Monitor {
         }
         for (phase, coefficients) in monitor.interp_coeff.iter_mut().enumerate() {
             let fraction = phase as f32 / PHASES as f32;
+            let mut taps = [0.; INTERP_TAPS];
             let mut total = 0.;
-            for (index, coefficient) in coefficients.iter_mut().enumerate() {
+            for (index, coefficient) in taps.iter_mut().enumerate() {
                 let position = index as f32 + fraction;
                 let t = core::f32::consts::PI * (position - 15.5);
                 let sinc = if t.abs() < 0.00001 {
@@ -133,8 +134,8 @@ impl Default for Monitor {
                 *coefficient = sinc * blackman(position, INTERP_TAPS);
                 total += *coefficient;
             }
-            for coefficient in coefficients {
-                *coefficient /= total;
+            for (coefficient, value) in coefficients.iter_mut().zip(taps) {
+                *coefficient = libm::roundf(value / total * 32768.).clamp(-32768., 32767.) as i16;
             }
         }
         monitor
@@ -144,7 +145,7 @@ impl Default for Monitor {
 impl Monitor {
     fn reset_history(&mut self) {
         self.history.fill(0.);
-        self.analytic.fill((0., 0.));
+        self.analytic.fill((0, 0));
         self.head = 0;
         self.analytic_head = 0;
         self.phase = 0;
@@ -196,13 +197,21 @@ impl Monitor {
             let distance = 2 * index + 1;
             q += coefficient * (history[127 - distance] - history[127 + distance]);
         }
-        let iq = (history[127], q);
+        // Six dB headroom also bounds every Q15 dot product within i32.
+        let iq = (
+            (history[127] * 0.5).clamp(-16384., 16383.) as i16,
+            (q * 0.5).clamp(-16384., 16383.) as i16,
+        );
         self.analytic[self.analytic_head] = iq;
         self.analytic[self.analytic_head + INTERP_TAPS] = iq;
         self.analytic_head = (self.analytic_head + 1) % INTERP_TAPS;
     }
 
     /// Fill signed ci16 at 120 ksps. A short/absent input batch fades to silence.
+    // Keep the hot loop in RAM to avoid shared flash-cache contention with USB
+    // and the millisecond PLL controller on the other core.
+    #[inline(never)]
+    #[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.tx_monitor"))]
     pub fn render(&mut self, output: &mut [u8], input: &[i16], config: Config) {
         let expected = self.input_count(output.len() / 4);
         self.ready &= config.enabled && input.len() == expected;
@@ -225,17 +234,17 @@ impl Monitor {
                 };
                 self.push(sample);
             }
-            let table_phase = u64::from(self.phase) * PHASES as u64;
+            let table_phase = u64::from(self.phase) * PHASES as u64 + SCALE / 2;
             let index = (table_phase >> 32) as usize;
-            let fraction = (table_phase as u32) as f32 / SCALE as f32;
             let history = &self.analytic[self.analytic_head..self.analytic_head + INTERP_TAPS];
-            let (mut i, mut q) = (0., 0.);
-            for (tap, &(hi, hq)) in history.iter().rev().enumerate() {
-                let a = self.interp_coeff[index][tap];
-                let coefficient = a + fraction * (self.interp_coeff[index + 1][tap] - a);
-                i += coefficient * hi;
-                q += coefficient * hq;
+            let (mut i, mut q) = (0i32, 0i32);
+            for (&coefficient, &(hi, hq)) in
+                self.interp_coeff[index].iter().zip(history.iter().rev())
+            {
+                i += i32::from(coefficient) * i32::from(hi);
+                q += i32::from(coefficient) * i32::from(hq);
             }
+            let (i, mut q) = (i as f32 / 32768., q as f32 / 32768.);
             if config.mode == Mode::Lsb {
                 q = -q;
             }
@@ -247,7 +256,7 @@ impl Monitor {
                     -1. / FADE_SAMPLES
                 })
             .clamp(0., 1.);
-            let scale = 0.5 * self.gain;
+            let scale = self.gain;
             bytes[..2].copy_from_slice(&((i * scale).clamp(-32768., 32767.) as i16).to_le_bytes());
             bytes[2..].copy_from_slice(&((q * scale).clamp(-32768., 32767.) as i16).to_le_bytes());
         }
@@ -314,6 +323,15 @@ mod tests {
             sum.1 += q * cos - i * sin;
         }
         libm::sqrtf(sum.0 * sum.0 + sum.1 * sum.1) / samples.len() as f32
+    }
+
+    #[test]
+    fn interpolation_accumulators_fit_full_scale_analytic_input() {
+        let monitor = Monitor::default();
+        for coefficients in &monitor.interp_coeff {
+            let absolute_sum: i64 = coefficients.iter().map(|&c| i64::from(c).abs()).sum();
+            assert!(absolute_sum * 16384 <= i64::from(i32::MAX));
+        }
     }
 
     #[test]
