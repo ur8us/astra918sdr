@@ -180,6 +180,12 @@ previous interrupted transfer may leave a partial old frame in the USB FIFO.
 Reset the frame parser only after draining. Keep I/Q reads independent of
 control exchanges; a receiver reconfiguration can take longer than the I/Q
 backpressure deadline. Join the reader before Stop/drain or transport teardown.
+TX and RF recovery retain the requested USB stream with zero samples while
+capture is unavailable. A false configured flag alone does not end that stream.
+SDR++ keeps reading during control exchanges and discards its oldest decoded
+frames if its UI queue fills while waiting for matching generation metadata.
+Its control deadline is 15 seconds to cover the firmware's eight-second RF
+configuration deadline plus reset and relay delays.
 
 CAT uses semicolon-delimited ASCII, bounded 32-byte requests. `FA`/`MD` read
 and set the dial/mode; `IF`, `ID`, `AI`, `FR`, `FW`, `FB`, `FT`, `PS`, `KS` and
@@ -200,5 +206,7 @@ width readback ([Hamlib 4.6.2 implementation](https://github.com/Hamlib/Hamlib/b
 
 Simulator ports N through N+3 carry the identical control/IQ/CAT and raw mono
 PCM bytes. Test-only command 70 hex sets fault bits: bit0 fail next configure,
-bit1 stall I/Q. It is absent from the physical firmware. UTC-aligned WAV input
+bit1 stall I/Q, bit2 simulated TX with zero I/Q/audio. Leaving simulated TX starts
+a new receive generation. RF faults also send zeros while streaming is requested.
+It is absent from the physical firmware. UTC-aligned WAV input
 and PTY CAT are test adapters; simulated saves use the production CRC codec.

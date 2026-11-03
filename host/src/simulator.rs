@@ -122,6 +122,11 @@ fn control(mut socket: TcpStream, state: State, owner: Arc<AtomicBool>) {
                 if cmd == 0x70 && p.len() == 1 {
                     s.fail_next = p[0] & 1 != 0;
                     s.stall_iq = p[0] & 2 != 0;
+                    let tx_active = p[0] & 4 != 0;
+                    if s.radio.tx_active && !tx_active {
+                        s.radio.generation = s.radio.generation.wrapping_add(1);
+                    }
+                    s.radio.tx_active = tx_active;
                     return Ok(None);
                 }
                 let (settings, action) = s.radio.prepare(cmd, p)?;
@@ -293,13 +298,16 @@ fn produce(
                 ((10000. * angle.cos()) as i16, (10000. * angle.sin()) as i16)
             };
             let ((i, q), v) = dsp.process(i, q);
-            frame.extend_from_slice(&i.to_le_bytes());
-            frame.extend_from_slice(&q.to_le_bytes());
+            let receiving = r.configured && !r.tx_active;
+            frame.extend_from_slice(&(if receiving { i } else { 0 }).to_le_bytes());
+            frame.extend_from_slice(&(if receiving { q } else { 0 }).to_le_bytes());
             if let Some(v) = v {
-                pcm.extend_from_slice(&(if r.configured { v } else { 0 }).to_le_bytes());
+                pcm.extend_from_slice(&(if receiving { v } else { 0 }).to_le_bytes());
             }
         }
-        if r.streaming && r.configured && !stall && iq.try_send(frame).is_err() {
+        // Device firmware keeps the USB timeline alive with zeros while RF
+        // hardware is unavailable, including TX/RX recovery.
+        if r.streaming && !stall && iq.try_send(frame).is_err() {
             let mut s = state.lock().unwrap();
             s.radio.dropped = s.radio.dropped.saturating_add(1);
             s.radio.streaming = false;
