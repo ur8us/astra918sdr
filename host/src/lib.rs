@@ -25,6 +25,23 @@ pub struct Device {
     pub serial: String,
     pub label: String,
 }
+fn status_reason(status: u8) -> &'static str {
+    match status {
+        1 => "unknown command",
+        2 => "protocol version mismatch",
+        3 => "invalid payload length",
+        4 => "invalid argument",
+        5 => "unsupported by this firmware",
+        6 => "receiver busy or experiment has sealed commands",
+        7 => "bandwidth unavailable",
+        8 => {
+            "receiver hardware I/O failed or timed out; a register write may still have taken effect"
+        }
+        9 => "PLL did not lock",
+        10 => "internal receiver error",
+        _ => "unknown status",
+    }
+}
 pub fn devices() -> Result<Vec<Device>> {
     use rusb::UsbContext;
     let context = rusb::Context::new()?;
@@ -48,8 +65,8 @@ pub fn devices() -> Result<Vec<Device>> {
 impl Client {
     pub fn tcp(address: &str) -> Result<Self> {
         let wire = TcpStream::connect(address).context("Connect simulator")?;
-        wire.set_read_timeout(Some(Duration::from_secs(5)))?;
-        wire.set_write_timeout(Some(Duration::from_secs(5)))?;
+        wire.set_read_timeout(Some(Duration::from_secs(10)))?;
+        wire.set_write_timeout(Some(Duration::from_secs(10)))?;
         Ok(Self {
             wire: Wire::Tcp(wire),
             sequence: 0,
@@ -75,6 +92,30 @@ impl Client {
             handle
                 .claim_interface(a::INTERFACE)
                 .context("Vendor interface busy or inaccessible; close the other controller")?;
+            // An interrupted owner can leave a partial AST1 reply queued on
+            // the IN endpoint. Drain it before starting this process's
+            // sequence at 1, otherwise every new CLI invocation reads the
+            // stale bytes and reports a mismatched reply.
+            let mut stale = [0u8; 256];
+            let mut drained = false;
+            for _ in 0..16 {
+                match handle.read_bulk(a::REPLY_EP, &mut stale, Duration::from_millis(20)) {
+                    Err(rusb::Error::Timeout) => {
+                        drained = true;
+                        break;
+                    }
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = handle.release_interface(a::INTERFACE);
+                        return Err(error).context("Drain stale Astra918 USB replies");
+                    }
+                }
+            }
+            if !drained {
+                let _ = handle.release_interface(a::INTERFACE);
+                bail!("Astra918 USB reply queue did not drain; reconnect USB");
+            }
             return Ok(Self {
                 wire: Wire::Usb(handle),
                 sequence: 0,
@@ -96,7 +137,7 @@ impl Client {
                 s.read_exact(&mut out)?;
             }
             Wire::Usb(s) => {
-                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 let mut used = 0;
                 while used < 256 {
                     ensure!(
@@ -138,11 +179,27 @@ impl Client {
         out[6] = 0;
         let (_, payload) = a::parse(&out).map_err(|e| anyhow::anyhow!("Malformed reply: {e:?}"))?;
         self.usable = true;
-        ensure!(status == 0, "Receiver rejected command: status {status}");
+        ensure!(
+            status == 0,
+            "Receiver rejected command: status {status} ({}, command 0x{cmd:02X})",
+            status_reason(status)
+        );
         Ok(payload.to_vec())
     }
     pub fn state(&mut self) -> Result<Receiver> {
-        decode(&self.command(v2::STATUS, &[])?)
+        self.state_with_features().map(|(receiver, _)| receiver)
+    }
+    /// Read the authoritative receiver state and its feature flags atomically.
+    pub fn state_with_features(&mut self) -> Result<(Receiver, u8)> {
+        let payload = self.command(v2::STATUS, &[])?;
+        let receiver = decode(&payload)?;
+        Ok((receiver, payload[120]))
+    }
+    /// Nominal synthesized USB audio channel minus requested channel, in µHz.
+    pub fn rx_tuning_error(&mut self) -> Result<i64> {
+        let payload = self.command(a::RX_TUNING_ERROR, &[])?;
+        ensure!(payload.len() == 8, "Invalid tuning-error reply length");
+        Ok(i64::from_le_bytes(payload[..].try_into()?))
     }
 }
 impl Drop for Client {
@@ -154,6 +211,11 @@ impl Drop for Client {
 }
 pub fn decode(p: &[u8]) -> Result<Receiver> {
     ensure!(p.len() == a::STATE_SIZE, "Invalid state length");
+    let combined = p[120] & a::FEATURE_COMBINED_SETTINGS != 0;
+    let has_tx = p[127] & 1 != 0;
+    let has_iq = p[120] & a::FEATURE_IQ_COMPENSATION != 0 && (combined || !has_tx);
+    let (enable, threshold) = if combined { (62, 63) } else { (123, 124) };
+    ensure!(!has_tx || p[enable] <= 1, "Invalid TX enabled flag");
     let u32at = |o| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
     let settings = Settings {
         dial: u64::from_le_bytes(p[..8].try_into()?),
@@ -188,6 +250,25 @@ pub fn decode(p: &[u8]) -> Result<Receiver> {
         } else {
             IfFrequency::Auto
         },
+        tx_enabled: has_tx && p[enable] == 1,
+        tx_threshold_dbfs: if has_tx { p[threshold] as i8 } else { -40 },
+        tx_key_ms: if p[127] & 1 != 0 { p[125] } else { 10 },
+        tx_unkey_ms: if p[127] & 1 != 0 { p[126] } else { 100 },
+        tx_relay_delay_ms: if p[120] & a::FEATURE_TX_RELAY_DELAY != 0 {
+            u16::from_le_bytes([p[60], p[61]])
+        } else {
+            50
+        },
+        tx_drive_ma: if p[127] & a::FEATURE_TX_DRIVE != 0 {
+            p[93]
+        } else {
+            4
+        },
+        tx_slew_fast: p[127] & a::FEATURE_TX_SLEW == 0 || p[127] & a::TX_SLEW_FAST != 0,
+        tx_differential: p[127] & a::FEATURE_TX_OUTPUTS == 0
+            || p[127] & a::TX_OUTPUTS_IN_PHASE == 0,
+        running_iq: if has_iq { p[123] & 1 != 0 } else { true },
+        iq_on_large_retune: has_iq && p[123] & 2 != 0,
     };
     settings
         .validate()
@@ -196,11 +277,14 @@ pub fn decode(p: &[u8]) -> Result<Receiver> {
         p[30] <= 1 && p[31] <= 1 && p[34] <= 1 && p[35] <= 1,
         "Invalid state flags"
     );
+    ensure!(!has_iq || p[123] & !3 == 0, "Invalid I/Q settings");
+    ensure!(!has_iq || p[124] <= 2, "Invalid I/Q calibration status");
     Ok(Receiver {
         settings,
         revision: u32at(96),
         generation: u32at(36),
         streaming: p[34] != 0,
+        tx_active: p[127] & 2 != 0,
         configured: p[35] != 0,
         error: u32at(52),
         dropped: u32at(40),
@@ -212,5 +296,6 @@ pub fn decode(p: &[u8]) -> Result<Receiver> {
         saved_revision: u32at(112),
         chip_status: p[56],
         rssi: i16::from_le_bytes(p[58..60].try_into()?),
+        iq_cal_status: if has_iq { p[124] } else { 0 },
     })
 }

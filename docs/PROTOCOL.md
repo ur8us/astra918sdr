@@ -1,7 +1,8 @@
 # AST1 control and ASIQ stream, version 1
 
-USB VID:PID `c0de:091a` is the development identity. Five interfaces: UAC1 0–1,
-CDC 2–3, vendor 4. Vendor OUT `03`, control IN `84`, I/Q IN `85`. Do not claim
+USB VID:PID `c0de:091a` is the development identity. Recording uses UAC1 0–1,
+CDC 2–3, vendor 4 and playback UAC1 5–6. Playback OUT is `06`.
+Vendor OUT `03`, control IN `84`, I/Q IN `85`. Do not claim
 audio/CDC, detach their drivers, reset the device or set its configuration.
 One vendor owner serializes commands; CAT has a separate bounded parser and
 joins the same authoritative state machine. There is no unsolicited vendor
@@ -38,17 +39,39 @@ so clients can report and recover from the fault.
 | Logical GPIO values | 3b | byte affected-bit mask, byte desired values; bit 0 is GPIO0 |
 | VFO sign | 3c | byte Auto=0, LO above signal=1, LO below signal=2 |
 | IF frequency | 3d | byte Auto=0 (96 kHz), 96 kHz=1, 120 kHz=2 |
+| I/Q compensation settings | 3e | byte affected-bit mask, byte desired values; bit 0 = continuous running, bit 1 = internal-pilot on large retune |
+| Factory reset | 3f | empty; erase both saved-settings sectors and apply defaults now |
+| Read CMX918 register | 40 | byte register address; reply is one byte |
+| Write CMX918 register | 41 | byte register address, byte value; reply is the normal status snapshot |
+| Calibrate I/Q now | 42 | empty; force one internal-pilot calibration at the current RF tune |
+| Carrier control | 43 | `<BQ>` mode 0 stop, mode 1 RF Hz, mode 2 LDIV Hz, with a 40-byte start report |
+| Measure frequency during LDIV test | 44 | empty, eight FC0 status/result pairs, LDIV-only mode |
+| USB audio tuning error | 45 | empty, signed i64 nominal actual-minus-requested microhertz |
+| TX outputs drive strength | 46 | empty query returns one byte, setter accepts 2/4/8/12 mA |
+| TX outputs edge rate | 47 | empty query returns one byte, setter accepts slow=0 or fast=1 |
+| TX outputs | 48 | empty query returns one byte, setter accepts Differential=0 or In-phase=1 |
+| TX/RX Relay delay | 49 | empty query returns u16 milliseconds, setter accepts u16 0–1000, default 50 |
+| TX configuration | 4a | empty query or four bytes, enable 0/1, signed RMS dBFS, audio key ms, audio unkey ms |
 
 IDs above are hexadecimal. Setters normally reply with the complete status
-snapshot. Legacy arbitrary sample-rate/FIR/register/BOOTSEL commands are not
+snapshot. Raw register access requires I/Q to be stopped (status 6 otherwise),
+uses one bounded I2C transaction, and does not change or save receiver settings.
+Subsequent receiver configuration can overwrite a raw write. Arbitrary writes
+can disturb reception, including USB audio, so callers must use the CMX918
+register map. Legacy arbitrary sample-rate/FIR/BOOTSEL commands are not
 part of this interface. Status codes: 0 OK, 1 command, 2 version, 3 length,
 4 argument, 5 unsupported, 6 busy, 7 spectrum bounds, 8 I/O, 9 PLL, 10 internal.
 Capabilities retain the inherited 204-byte layout; only rate slot zero (120000)
-is selectable. Status byte 120 bit 5 advertises VFO sign and IF selection,
+is selectable. Status byte 120 bit 0 advertises I/Q compensation settings;
+bit 1 advertises factory reset;
+bit 2 advertises one-shot internal-pilot calibration;
+bit 3 advertises TX/RX relay delay;
+bit 4 advertises the combined IQ/TX layout and command 4a;
+bit 5 advertises VFO sign and IF selection,
 bit 6 advertises reference selection and bit 7
 advertises the eight logical GPIO values. This leaves the capabilities reply
 compatible with existing clients. Do not mistake the inherited reserved rate
-slots for support.
+slots for support. Capabilities byte 31 bit 4 advertises raw register access.
 
 Command 38 requires a configured receiver and validates the complete audio
 passband inside the current spectrum. It changes the DSP epoch without writing
@@ -67,7 +90,7 @@ The status payload is 128 bytes. Its authoritative fields are:
 
 | Offset | Type | Meaning |
 |---|---|---|
-| 0 / 8 | u64 / u64 | Dial / rounded hardware spectrum center |
+| 0 / 8 | u64 / u64 | Dial / whole-Hz hardware spectrum center |
 | 16 / 20 / 24 | u32 each | Rate / hardware filter bandwidth / flags |
 | 28 / 29 | u8 each | Requested / resolved input |
 | 30 / 31 | u8 each | RF / IF gain mode (0 automatic) |
@@ -76,23 +99,68 @@ The status payload is 128 bytes. Its authoritative fields are:
 | 36 | u32 | Stream generation |
 | 40 / 44 / 48 / 52 | u32 each | I/Q drops / capture faults / USB faults / last error |
 | 56 / 57 / 58 | u8 / u8 / i16 | Chip status / valid / raw RSSI |
+| 60 / 62 / 63 | u16 / u8 / i8 | Relay delay ms / TX enable / TX RMS threshold dBFS, with byte 120 bit 4 |
 | 64–75 | bytes | Unknown inherited loss counters, all ff |
 | 76 / 78 / 79 | u16 / u8 / u8 | Capacitor / LF gain / LF attenuator |
 | 80 / 88 | u64 / i32 | Exact spectrum center / signed channel offset |
 | 92 / 94 | u8 / u16 | Audio mode / low edge |
+| 93 | u8 | Shared TX output drive strength mA, with byte 127 bit 3 |
 | 96 | u32 | Settings revision |
 | 100 / 104 / 108 | u32 each | Audio underruns / overruns / USB stalls |
 | 112 / 116 | u32 / u16 | Saved revision (ffffffff initially unsaved) / high edge |
 | 118 / 119 | u8 / u8 | Requested reference source / logical GPIO bitmask |
 | 120 / 121 / 122 | u8 / u8 / u8 | Feature bits / requested VFO sign / requested IF frequency |
+| 123 / 124 | u8 / u8 | I/Q settings bits (same layout as command 3e) / pilot status: 0 never attempted, 1 complete, 2 unavailable or incomplete |
+| 125 / 126 | u8 / u8 | Audio key/unkey milliseconds |
+| 127 | u8 | Bit 0 TX support, 1 active TX, 2 tuning-error support, 3 drive support, 4 slew support, 5 Fast slew selected, 6 output-mode support, 7 In-phase selected |
+
+The combined layout retains command 3e and the I/Q fields at 123/124. TX
+configuration uses command 4a and bytes 62/63, 125/126. A TX-only legacy
+layout has byte 127 bit 0 set, byte 120 bit 4 clear, and uses command 3e with
+four bytes and status 123/124 for TX enable/threshold. The shared host decoder
+distinguishes all three layouts. The GUI selects the appropriate TX command.
+Command 3e I/Q edits and command 42 calibration return Busy during TX.
+Carrier control and measurement details are in [TRX.md](TRX.md).
 
 Other bytes are reserved. GPIO bits are receiver-owned state only; no physical
-RP2350 pins are assigned. All four settings apply immediately and only command 36
-persists them. Auto sign uses LO above below 2 MHz and LO below from 2 MHz;
-Auto IF uses 96 kHz. Forced LO below is rejected when the rounded center is at
+RP2350 pins are assigned. Settings apply immediately; only command 36 saves them.
+Command 3f is the explicit destructive exception: it pauses I/Q, erases and
+verifies both 4 KiB saved-settings sectors, resets the save sequence and applies
+`Settings::default()` to the live receiver. Erasing both sectors prevents an
+older alternating save from reappearing at boot. The status saved revision becomes
+`ffffffff` (unsaved); later changes remain volatile until command 36. CAT and USB
+audio interfaces remain enumerated. If RF reconfiguration fails after a
+successful erase, the command still returns OK and status reports an RF fault;
+Retry can restore reception. An erase/readback failure returns status 8. Do not
+assume a successful reset without an OK reply.
+I/Q running compensation defaults on; pilot-on-large-retune defaults off. Turning
+the latter on calibrates on the first tune, on a change of RF input/reference/LO
+sign/IF, or after the spectrum center has moved at least 500 kHz from the last
+successful calibration. Audio offset edits using command 38 retain the center and
+do not trigger pilot calibration. Pilot generation is turned off before reception
+resumes. An unavailable pilot or a lock/readiness failure sets status byte 124 to 2 and does not
+reject an otherwise valid RF tune; running compensation remains independent.
+After a failed attempt, another automatic attempt is deferred until the center
+moves 500 kHz from that failure or the RF path changes.
+Status 124 is live diagnostic state, not a saved setting. Command 37 forces a
+new pilot attempt when pilot-on-large-retune is enabled.
+Command 42 forces a single attempt even when pilot-on-large-retune is off. It
+requires an already configured receiver (status 8 otherwise), briefly pauses
+I/Q capture, temporarily retunes to a documented discrete pilot frequency
+(CMX918 datasheet Table 11), generates the internal tone, then switches the
+pilot off and restores the requested RF tune before capture resumes. Its
+normal status snapshot reports byte 124 as 1 for complete or 2 for unavailable
+or incomplete; a pilot result of 2 leaves the RF tune valid. The command does
+not change the automatic policy or write flash. I/O or restore failure returns
+status 8 and marks an RF fault; Retry can reconfigure the receiver. No external
+frequency generator is involved.
+Auto sign uses LO above below 2 MHz and LO below from 2 MHz;
+Auto IF uses 96 kHz. Forced LO below is rejected when the exact center is at
 or below the selected IF. Sign/IF edits retune the same center and run the CMX918
 IF-filter and PLL calibration; the dial and audio offset are retained. Flash record
-format 3 reads formats 1 and 2, defaulting the new settings to Auto. Format 1
+format 9 reads receiver formats 1–4 and TX formats 4–8. Capabilities stored in
+the record distinguish the two version-4 layouts. Fields absent in an older
+format receive their current defaults. Formats 1 and 2 default sign/IF to Auto. Format 1
 also defaults to Internal reference and clears all GPIO bits. The firmware state codecs in `firmware/src/astra.rs`
 are normative. Gain tables and hardware constraints are in `controls.rs`.
 

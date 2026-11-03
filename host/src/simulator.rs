@@ -38,6 +38,7 @@ struct Args {
 }
 struct Shared {
     radio: Receiver,
+    registers: [u8; 256],
     save_path: PathBuf,
     save_sequence: u32,
     fail_next: bool,
@@ -48,7 +49,13 @@ fn apply(s: &mut Shared, settings: a::Settings, action: Action) -> Result<()> {
     if s.fail_next
         && matches!(
             action,
-            Action::Configure | Action::Clock | Action::Capacitor | Action::Retry | Action::Channel
+            Action::Configure
+                | Action::Clock
+                | Action::Capacitor
+                | Action::Retry
+                | Action::Channel
+                | Action::CalibrateNow
+                | Action::FactoryReset
         )
     {
         s.fail_next = false;
@@ -68,6 +75,21 @@ fn apply(s: &mut Shared, settings: a::Settings, action: Action) -> Result<()> {
         f.sync_all()?;
         s.save_sequence = seq;
     }
+    if action == Action::FactoryReset {
+        for slot in 0..2 {
+            let path = s.save_path.join(format!("slot{slot}.bin"));
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        s.save_sequence = 0;
+        s.registers[0x07] &= !1;
+    }
+    if action == Action::Clock {
+        s.registers[0x07] = (s.registers[0x07] & !1) | settings.reference as u8;
+    }
     s.radio.commit(
         settings,
         if action == Action::Clock {
@@ -76,6 +98,10 @@ fn apply(s: &mut Shared, settings: a::Settings, action: Action) -> Result<()> {
             action
         },
     );
+    if action == Action::CalibrateNow {
+        // The offline simulator has no CMX918 pilot or coefficient registers.
+        s.radio.iq_cal_status = 2;
+    }
     Ok(())
 }
 fn control(mut socket: TcpStream, state: State, owner: Arc<AtomicBool>) {
@@ -96,13 +122,25 @@ fn control(mut socket: TcpStream, state: State, owner: Arc<AtomicBool>) {
                 if cmd == 0x70 && p.len() == 1 {
                     s.fail_next = p[0] & 1 != 0;
                     s.stall_iq = p[0] & 2 != 0;
-                    return Ok(());
+                    return Ok(None);
                 }
                 let (settings, action) = s.radio.prepare(cmd, p)?;
-                apply(&mut s, settings, action).map_err(|_| a::Status::Io)
+                match action {
+                    Action::RegisterRead(address) => Ok(Some(s.registers[address as usize])),
+                    Action::RegisterWrite(address, value) => {
+                        s.registers[address as usize] = value;
+                        Ok(None)
+                    }
+                    _ => apply(&mut s, settings, action)
+                        .map(|_| None)
+                        .map_err(|_| a::Status::Io),
+                }
             });
-            s.radio
-                .response(&raw, outcome.err().unwrap_or(a::Status::Ok))
+            match outcome {
+                Ok(Some(value)) => a::reply(&raw, a::Status::Ok, &[value]),
+                Ok(None) => s.radio.response(&raw, a::Status::Ok),
+                Err(status) => s.radio.response(&raw, status),
+            }
         };
         if socket.write_all(&reply).is_err() {
             break;
@@ -327,8 +365,12 @@ fn main() -> Result<()> {
         radio.saved_revision = 0;
     }
     radio.commit(radio.settings, Action::Configure);
+    let mut registers = [0u8; 256];
+    registers[0x07] = 0x30 | radio.settings.reference as u8;
+    registers[0x97] = 0x61;
     let state = Arc::new(Mutex::new(Shared {
         radio,
+        registers,
         save_path: args.settings,
         save_sequence: saved.map_or(0, |(_, s)| s),
         fail_next: false,
@@ -375,4 +417,71 @@ fn main() -> Result<()> {
         thread::spawn(move || control(socket, state, owner));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_shot_calibration_preserves_settings_and_reports_no_simulated_pilot() {
+        let mut shared = Shared {
+            radio: Receiver::default(),
+            registers: [0; 256],
+            save_path: PathBuf::new(),
+            save_sequence: 2,
+            fail_next: false,
+            stall_iq: false,
+        };
+        let settings = shared.radio.settings;
+        apply(&mut shared, settings, Action::Configure).unwrap();
+        shared.radio.commit(settings, Action::Save);
+        let revision = shared.radio.revision;
+        let saved_revision = shared.radio.saved_revision;
+        let generation = shared.radio.generation;
+        let sequence = shared.save_sequence;
+        let (settings, action) = shared.radio.prepare(a::IQ_CALIBRATE_NOW, &[]).unwrap();
+        apply(&mut shared, settings, action).unwrap();
+        assert_eq!(shared.radio.settings, settings);
+        assert_eq!(shared.radio.revision, revision);
+        assert_eq!(shared.radio.saved_revision, saved_revision);
+        assert_eq!(shared.radio.generation, generation + 1);
+        assert_eq!(shared.save_sequence, sequence);
+        assert_eq!(shared.radio.iq_cal_status, 2);
+    }
+
+    #[test]
+    fn factory_reset_deletes_both_saved_slots_and_applies_defaults() {
+        let path = std::env::temp_dir().join(format!(
+            "astra918-factory-reset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut shared = Shared {
+            radio: Receiver::default(),
+            registers: [0; 256],
+            save_path: path.clone(),
+            save_sequence: 0,
+            fail_next: false,
+            stall_iq: false,
+        };
+        let mut changed = shared.radio.settings;
+        changed.gpio = 0x5a;
+        shared.radio.commit(changed, Action::Logical);
+        apply(&mut shared, changed, Action::Save).unwrap();
+        apply(&mut shared, changed, Action::Save).unwrap();
+        assert!(path.join("slot0.bin").exists());
+        assert!(path.join("slot1.bin").exists());
+        let (defaults, action) = shared.radio.prepare(a::FACTORY_RESET, &[]).unwrap();
+        apply(&mut shared, defaults, action).unwrap();
+        assert_eq!(shared.radio.settings, a::Settings::default());
+        assert_eq!(shared.radio.saved_revision, u32::MAX);
+        assert_eq!(shared.save_sequence, 0);
+        assert!(!path.join("slot0.bin").exists());
+        assert!(!path.join("slot1.bin").exists());
+        fs::remove_dir(path).unwrap();
+    }
 }

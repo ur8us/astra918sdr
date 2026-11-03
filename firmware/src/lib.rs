@@ -8,9 +8,17 @@ pub mod control_v2;
 pub mod controls;
 pub mod dsp;
 mod dsp_tables;
+pub mod iq_cal;
+pub mod iq_stream;
 pub mod persistence;
 pub mod protocol;
 pub mod recovery;
+pub mod rx_pll;
+pub mod tx_audio;
+pub mod tx_control;
+pub mod tx_pins;
+pub mod tx_pll;
+pub mod tx_relay;
 pub mod wide_fir;
 pub const EXPERIMENTAL_MIN_HZ: u32 = 70_000;
 pub const EXPERIMENTAL_MAX_HZ: u32 = 260_000_000;
@@ -69,9 +77,7 @@ impl Config {
         if self.flags & !0x1ff != 0 || self.flags & 0xf0 != 0 && self.flags & XTAL_TRIM == 0 {
             return Err(Error::Protocol);
         }
-        if !self.frequency.is_multiple_of(100)
-            || !(EXPERIMENTAL_MIN_HZ..=EXPERIMENTAL_MAX_HZ).contains(&self.frequency)
-        {
+        if !(EXPERIMENTAL_MIN_HZ..=EXPERIMENTAL_MAX_HZ).contains(&self.frequency) {
             return Err(Error::Frequency);
         }
         if !(150_000..=108_000_000).contains(&self.frequency) && self.flags & EXPERIMENTAL_RF == 0 {
@@ -261,7 +267,16 @@ mod tests {
             assert_eq!(c.validate(), Err(Error::Frequency));
             assert!(Config { flags: 3, ..c }.validate().is_ok());
         }
-        for frequency in [69_900, 260_000_100, 1_234_567, u32::MAX] {
+        assert!(
+            Config {
+                frequency: 1_234_567,
+                flags: 3,
+                ..config()
+            }
+            .validate()
+            .is_ok()
+        );
+        for frequency in [69_900, 260_000_100, u32::MAX] {
             assert!(
                 Config {
                     frequency,

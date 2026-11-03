@@ -1,6 +1,10 @@
 /target/
 /artifacts/
-/docs/
+/experiments/
+/docs/*
+!/docs/PROTOCOL.md
+!/docs/TRX.md
+!/docs/registers.md
 /target/
 __pycache__/
 *.pyc

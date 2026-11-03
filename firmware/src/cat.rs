@@ -30,7 +30,8 @@ impl Default for Tuning {
 }
 impl Tuning {
     pub fn coarse_frequency(self) -> u32 {
-        ((self.frequency + 50) / 100) * 100
+        // Preserve the legacy accessor while tuning RX at exact whole Hz.
+        self.frequency
     }
     pub fn config(self) -> Config {
         Config {

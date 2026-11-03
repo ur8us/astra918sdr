@@ -5,7 +5,7 @@ use embassy_usb::{
     Builder, Handler,
     control::{InResponse, OutResponse, Recipient, Request, RequestType},
     descriptor::{SynchronizationType, UsageType},
-    driver::{Driver, Endpoint},
+    driver::{Driver, Endpoint, EndpointAddress},
     types::InterfaceNumber,
 };
 
@@ -129,5 +129,32 @@ pub fn microphone<'d, D: Driver<'d>>(
     control.streaming_interface = Some(streaming_number);
     drop(function);
     builder.handler(control);
+    endpoint
+}
+
+/// Separate playback function, appended after the established interfaces so
+/// that the vendor and CDC interface numbers remain compatible.
+pub fn speaker<'d, D: Driver<'d>>(builder: &mut Builder<'d, D>) -> D::EndpointOut {
+    let mut function = builder.function(1, 1, 0);
+    let mut interface = function.interface();
+    let streaming = u8::from(interface.interface_number()) + 1;
+    let mut alt = interface.alt_setting(1, 1, 0, None);
+    alt.descriptor(0x24, &[1, 0, 1, 30, 0, 1, streaming]);
+    alt.descriptor(0x24, &[2, 1, 0x01, 0x01, 0, 1, 0, 0, 0, 0]);
+    alt.descriptor(0x24, &[3, 2, 0x01, 0x03, 0, 1, 0]);
+    let mut interface = function.interface();
+    interface.alt_setting(1, 2, 0, None);
+    let mut alt = interface.alt_setting(1, 2, 0, None);
+    alt.descriptor(0x24, &[1, 1, 0, 1, 0]);
+    alt.descriptor(0x24, &[2, 1, 1, 2, 16, 1, 0xe0, 0x2e, 0]);
+    let endpoint = alt.endpoint_isochronous_out(
+        Some(EndpointAddress::from(0x06)),
+        26,
+        1,
+        SynchronizationType::Adaptive,
+        UsageType::DataEndpoint,
+        &[0, 0],
+    );
+    alt.descriptor(0x25, &[1, 0, 0, 0, 0]);
     endpoint
 }

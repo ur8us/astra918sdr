@@ -138,14 +138,17 @@ fn composite_topology_rate_controls_and_lifecycle() {
     let ep = usb_audio::microphone(&mut builder, &mut audio);
     let _cdc = CdcAcmClass::new(&mut builder, &mut cdc, 64);
     let (command, reply, iq) = usb_vendor::add(&mut builder);
+    let playback = usb_audio::speaker(&mut builder);
     assert_eq!(u8::from(command.info().addr), 0x03);
     assert_eq!(u8::from(reply.info().addr), 0x84);
     assert_eq!(u8::from(iq.info().addr), 0x85);
     let device = builder.build();
     drop(device);
     assert_eq!(ep.info().max_packet_size, 26);
+    assert_eq!(playback.info().max_packet_size, 26);
+    assert_eq!(u8::from(playback.info().addr), 0x06);
     let total = u16::from_le_bytes([config_buf[2], config_buf[3]]) as usize;
-    assert_eq!(config_buf[4], 5); // AC, AS, CDC control, CDC data, vendor
+    assert_eq!(config_buf[4], 7); // includes playback AC and AS
     let mut descriptors = Vec::new();
     let mut offset = 0;
     while offset < total {
@@ -154,7 +157,7 @@ fn composite_topology_rate_controls_and_lifecycle() {
         descriptors.push(&config_buf[offset..offset + n]);
         offset += n;
     }
-    assert_eq!(descriptors.iter().filter(|d| d[1] == 11).count(), 3); // IAD functions
+    assert_eq!(descriptors.iter().filter(|d| d[1] == 11).count(), 4); // IAD functions
     let mut addresses = std::collections::HashSet::new();
     let mut dpram = 256;
     for d in descriptors.iter().filter(|d| d[1] == 5) {
@@ -162,7 +165,7 @@ fn composite_topology_rate_controls_and_lifecycle() {
         let size = u16::from_le_bytes([d[4], d[5]]) as usize;
         dpram += size.div_ceil(64) * 64;
     }
-    assert_eq!(addresses.len(), 7);
+    assert_eq!(addresses.len(), 8);
     assert!(dpram <= 4096);
     let mslen = u16::from_le_bytes([msos[8], msos[9]]) as usize;
     assert!(msos[..mslen].windows(8).any(|w| w == b"WINUSB\0\0"));
@@ -179,7 +182,10 @@ fn composite_topology_rate_controls_and_lifecycle() {
             (1, 1, 1, 1, 2),
             (2, 0, 1, 2, 2),
             (3, 0, 2, 10, 0),
-            (4, 0, 3, 255, 0)
+            (4, 0, 3, 255, 0),
+            (5, 0, 0, 1, 1),
+            (6, 0, 0, 1, 2),
+            (6, 1, 1, 1, 2)
         ]
     );
     assert!(descriptors.contains(&&[9, 0x24, 1, 0, 1, 30, 0, 1, 1][..]));

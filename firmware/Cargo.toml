@@ -23,10 +23,11 @@ embedded-hal-async = "=1.0.0"
 libm = "=0.2.16"
 
 [target.'cfg(target_arch = "arm")'.dependencies]
+critical-section = "=1.2.0"
 embassy-embedded-hal = "=0.6.0"
 embassy-rp = { version = "=0.10.0", features = ["time-driver", "critical-section-impl", "unstable-pac"] }
 embassy-executor = { version = "=0.10.0", features = ["platform-cortex-m", "executor-thread"] }
-embassy-usb = { version = "=0.6.0", default-features = false, features = ["max-interface-count-5"] }
+embassy-usb = { version = "=0.6.0", default-features = false, features = ["max-interface-count-7"] }
 embassy-time = "=0.5.1"
 embassy-sync = "=0.8.0"
 embassy-futures = "=0.1.2"
@@ -39,6 +40,7 @@ defmt = "=1.1.1"
 defmt-rtt = { version = "=1.3.0", features = ["disable-blocking-mode"] }
 
 [dev-dependencies]
-embassy-usb = { version = "=0.6.0", default-features = false, features = ["max-interface-count-5"] }
+rp-pac = { version = "=7.0.0", features = ["rp235x"] }
+embassy-usb = { version = "=0.6.0", default-features = false, features = ["max-interface-count-7"] }
 futures = { version = "0.3", features = ["executor"] }
 critical-section = { version = "1.2", features = ["std"] }

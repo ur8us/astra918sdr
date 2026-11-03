@@ -25,6 +25,37 @@ pub const REFERENCE_SET: u8 = 0x3a;
 pub const GPIO_UPDATE: u8 = 0x3b;
 pub const VFO_SIGN_SET: u8 = 0x3c;
 pub const IF_FREQUENCY_SET: u8 = 0x3d;
+pub const TX_CONFIG: u8 = 0x4a;
+/// Explicitly erase both saved-settings slots and restore default settings.
+pub const FACTORY_RESET: u8 = 0x3f;
+pub const FEATURE_FACTORY_RESET: u8 = 2;
+pub const TX_CARRIER: u8 = 0x43;
+pub const TX_MEASURE: u8 = 0x44;
+/// Nominal USB audio channel tuning error (synthesized minus requested), i64 µHz.
+pub const RX_TUNING_ERROR: u8 = 0x45;
+pub const FEATURE_RX_TUNING_ERROR: u8 = 4; // status byte 127
+/// Empty query -> one byte mA; one-byte setter -> ordinary status snapshot.
+pub const TX_DRIVE: u8 = 0x46;
+pub const FEATURE_TX_DRIVE: u8 = 8; // status byte 127
+pub const TX_SLEW: u8 = 0x47;
+pub const FEATURE_TX_SLEW: u8 = 16; // status byte 127
+pub const TX_SLEW_FAST: u8 = 32; // status byte 127, valid with FEATURE_TX_SLEW
+pub const TX_OUTPUTS: u8 = 0x48;
+pub const TX_RELAY_DELAY: u8 = 0x49;
+pub const FEATURE_TX_RELAY_DELAY: u8 = 8; // status byte 120
+pub const FEATURE_COMBINED_SETTINGS: u8 = 16; // status byte 120
+pub const MAX_TX_RELAY_DELAY_MS: u16 = 1000;
+pub const FEATURE_TX_OUTPUTS: u8 = 64; // status byte 127
+pub const TX_OUTPUTS_IN_PHASE: u8 = 128; // status byte 127, valid with FEATURE_TX_OUTPUTS
+/// Mask/value update: bit 0 runs continuous I/Q correction; bit 1 enables pilot calibration.
+pub const IQ_COMPENSATION_SET: u8 = 0x3e;
+/// Erase both saved-settings sectors and apply defaults immediately.
+/// Run one internal-pilot I/Q calibration at the current RF center.
+pub const IQ_CALIBRATE_NOW: u8 = 0x42;
+pub const IQ_RUNNING: u8 = 1;
+pub const IQ_LARGE_RETUNE: u8 = 2;
+pub const FEATURE_IQ_COMPENSATION: u8 = 1;
+pub const FEATURE_IQ_CALIBRATE_NOW: u8 = 4;
 pub const STATE_SIZE: usize = 128;
 pub const IQ_HEADER: usize = 64;
 pub const IQ_SAMPLES: usize = 512;
@@ -112,6 +143,16 @@ pub struct Settings {
     pub gpio: u8,
     pub vfo_sign: VfoSign,
     pub if_frequency: IfFrequency,
+    pub tx_enabled: bool,
+    pub tx_threshold_dbfs: i8,
+    pub tx_key_ms: u8,
+    pub tx_unkey_ms: u8,
+    pub tx_relay_delay_ms: u16,
+    pub tx_drive_ma: u8,
+    pub tx_slew_fast: bool,
+    pub tx_differential: bool,
+    pub running_iq: bool,
+    pub iq_on_large_retune: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -126,6 +167,16 @@ impl Default for Settings {
             gpio: 0,
             vfo_sign: VfoSign::Auto,
             if_frequency: IfFrequency::Auto,
+            tx_enabled: true,
+            tx_threshold_dbfs: -40,
+            tx_key_ms: 10,
+            tx_unkey_ms: 100,
+            tx_relay_delay_ms: 50,
+            tx_drive_ma: 12,
+            tx_slew_fast: true,
+            tx_differential: true,
+            running_iq: true,
+            iq_on_large_retune: false,
         }
     }
 }
@@ -135,13 +186,22 @@ impl Settings {
     }
     pub fn hardware(self) -> Config {
         Config {
-            frequency: ((self.center() + 50) / 100 * 100) as u32,
+            frequency: self.center() as u32,
             rate: RATE,
             bandwidth: 100_000,
             flags: OPTIONS,
         }
     }
     pub fn validate(self) -> Result<Self, Status> {
+        if self.tx_relay_delay_ms > MAX_TX_RELAY_DELAY_MS {
+            return Err(Status::Argument);
+        }
+        if !matches!(self.tx_drive_ma, 2 | 4 | 8 | 12) {
+            return Err(Status::Argument);
+        }
+        if !(-60..=-6).contains(&self.tx_threshold_dbfs) {
+            return Err(Status::Argument);
+        }
         if !(u64::from(EXPERIMENTAL_MIN_HZ)..=u64::from(EXPERIMENTAL_MAX_HZ)).contains(&self.dial)
             || !(i64::from(EXPERIMENTAL_MIN_HZ)..=i64::from(EXPERIMENTAL_MAX_HZ))
                 .contains(&self.center())
@@ -160,7 +220,7 @@ impl Settings {
                 i64::from(self.offset) - i64::from(self.low),
             ),
         };
-        // 500 Hz guard includes the audio transition and coarse-center correction.
+        // 500 Hz guard includes the audio filter transition.
         if bottom < -59_500 || top > 59_500 {
             return Err(Status::Bandwidth);
         }
@@ -184,10 +244,15 @@ impl Settings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Query,
+    RegisterRead(u8),
+    RegisterWrite(u8, u8),
     Configure,
     Channel,
     Capacitor,
     Logical,
+    IqSettings,
+    CalibrateNow,
+    FactoryReset,
     Clock,
     Start,
     Stop,
@@ -200,6 +265,7 @@ pub struct Receiver {
     pub revision: u32,
     pub generation: u32,
     pub streaming: bool,
+    pub tx_active: bool,
     pub configured: bool,
     pub error: u32,
     pub dropped: u32,
@@ -211,6 +277,8 @@ pub struct Receiver {
     pub saved_revision: u32,
     pub chip_status: u8,
     pub rssi: i16,
+    /// 0 never attempted, 1 successful, 2 pilot unavailable or incomplete.
+    pub iq_cal_status: u8,
 }
 impl Default for Receiver {
     fn default() -> Self {
@@ -219,6 +287,7 @@ impl Default for Receiver {
             revision: 0,
             generation: 0,
             streaming: false,
+            tx_active: false,
             configured: false,
             error: 0,
             dropped: 0,
@@ -230,17 +299,84 @@ impl Default for Receiver {
             saved_revision: u32::MAX,
             chip_status: 0,
             rssi: 0,
+            iq_cal_status: 0,
         }
     }
 }
 impl Receiver {
     pub fn prepare(&self, cmd: u8, p: &[u8]) -> Result<(Settings, Action), Status> {
+        if self.tx_active && matches!(cmd, IQ_COMPENSATION_SET | IQ_CALIBRATE_NOW) {
+            return Err(Status::Busy);
+        }
         let mut s = self.settings;
+        if cmd == TX_RELAY_DELAY {
+            if p.is_empty() {
+                return Ok((s, Action::Query));
+            }
+            if p.len() != 2 {
+                return Err(Status::Length);
+            }
+            s.tx_relay_delay_ms = u16::from_le_bytes([p[0], p[1]]);
+            return Ok((s.validate()?, Action::Logical));
+        }
+        if cmd == TX_OUTPUTS {
+            if p.is_empty() {
+                return Ok((s, Action::Query));
+            }
+            if p.len() != 1 {
+                return Err(Status::Length);
+            }
+            if p[0] > 1 {
+                return Err(Status::Argument);
+            }
+            s.tx_differential = p[0] == 0;
+            return Ok((s.validate()?, Action::Logical));
+        }
+        if cmd == TX_SLEW {
+            if p.is_empty() {
+                return Ok((s, Action::Query));
+            }
+            if p.len() != 1 {
+                return Err(Status::Length);
+            }
+            if p[0] > 1 {
+                return Err(Status::Argument);
+            }
+            s.tx_slew_fast = p[0] == 1;
+            return Ok((s.validate()?, Action::Logical));
+        }
+        if cmd == TX_DRIVE {
+            if p.is_empty() {
+                return Ok((s, Action::Query));
+            }
+            if p.len() != 1 {
+                return Err(Status::Length);
+            }
+            s.tx_drive_ma = p[0];
+            return Ok((s.validate()?, Action::Logical));
+        }
+        if cmd == TX_CONFIG {
+            if p.is_empty() {
+                return Ok((s, Action::Query));
+            }
+            if p.len() != 4 {
+                return Err(Status::Length);
+            }
+            if p[0] > 1 {
+                return Err(Status::Argument);
+            }
+            s.tx_enabled = p[0] != 0;
+            s.tx_threshold_dbfs = p[1] as i8;
+            s.tx_key_ms = p[2];
+            s.tx_unkey_ms = p[3];
+            return Ok((s.validate()?, Action::Logical));
+        }
         let n = match cmd {
             v2::VERSION_GET
             | v2::INFO
             | v2::CAPS
             | v2::STATUS
+            | RX_TUNING_ERROR
             | v2::FREQUENCY_GET
             | v2::RATE_GET
             | v2::INPUT_GET
@@ -250,17 +386,34 @@ impl Receiver {
             | v2::START
             | v2::STOP
             | SAVE
+            | FACTORY_RESET
+            | IQ_CALIBRATE_NOW
             | RETRY => 0,
             v2::FREQUENCY_SET | CHANNEL_TUNE | CENTER_TUNE => 8,
             OFFSET | AUDIO_FILTER | v2::RATE_SET | v2::OPTIONS => 4,
-            MODE | v2::INPUT_SET | REFERENCE_SET | VFO_SIGN_SET | IF_FREQUENCY_SET => 1,
-            v2::GAIN_MODE | v2::GAIN_SET | v2::LF_MF_CAPACITOR_SET | GPIO_UPDATE => 2,
+            MODE
+            | v2::INPUT_SET
+            | REFERENCE_SET
+            | VFO_SIGN_SET
+            | IF_FREQUENCY_SET
+            | v2::REGISTER_READ => 1,
+            v2::GAIN_MODE
+            | v2::GAIN_SET
+            | v2::LF_MF_CAPACITOR_SET
+            | GPIO_UPDATE
+            | IQ_COMPENSATION_SET
+            | v2::REGISTER_WRITE => 2,
             _ => return Err(Status::Command),
         };
         if p.len() != n {
             return Err(Status::Length);
         }
+        if self.streaming && matches!(cmd, v2::REGISTER_READ | v2::REGISTER_WRITE) {
+            return Err(Status::Busy);
+        }
         let action = match cmd {
+            v2::REGISTER_READ => Action::RegisterRead(p[0]),
+            v2::REGISTER_WRITE => Action::RegisterWrite(p[0], p[1]),
             v2::FREQUENCY_SET => {
                 s.dial = u64::from_le_bytes(p.try_into().unwrap());
                 Action::Configure
@@ -299,6 +452,31 @@ impl Receiver {
             GPIO_UPDATE => {
                 s.gpio = (s.gpio & !p[0]) | (p[1] & p[0]);
                 Action::Logical
+            }
+            IQ_COMPENSATION_SET => {
+                if p[0] & !3 != 0 || p[1] & !3 != 0 || p[1] & !p[0] != 0 {
+                    return Err(Status::Argument);
+                }
+                if p[0] & IQ_RUNNING != 0 {
+                    s.running_iq = p[1] & IQ_RUNNING != 0;
+                }
+                if p[0] & IQ_LARGE_RETUNE != 0 {
+                    s.iq_on_large_retune = p[1] & IQ_LARGE_RETUNE != 0;
+                }
+                Action::IqSettings
+            }
+            FACTORY_RESET => {
+                if self.tx_active {
+                    return Err(Status::Busy);
+                }
+                s = Settings::default();
+                Action::FactoryReset
+            }
+            IQ_CALIBRATE_NOW => {
+                if !self.configured {
+                    return Err(Status::Io);
+                }
+                Action::CalibrateNow
             }
             MODE => {
                 s.mode = match p[0] {
@@ -348,9 +526,21 @@ impl Receiver {
             self.revision = self.revision.wrapping_add(1);
         }
         match action {
-            Action::Configure | Action::Clock | Action::Retry | Action::Channel => {
+            Action::Configure
+            | Action::Clock
+            | Action::Retry
+            | Action::Channel
+            | Action::IqSettings
+            | Action::CalibrateNow => {
                 self.configured = true;
                 self.error = 0;
+                self.generation = self.generation.wrapping_add(1);
+            }
+            Action::FactoryReset => {
+                self.configured = true;
+                self.error = 0;
+                self.saved_revision = u32::MAX;
+                self.iq_cal_status = 0;
                 self.generation = self.generation.wrapping_add(1);
             }
             Action::Capacitor => {
@@ -363,7 +553,7 @@ impl Receiver {
             }
             Action::Stop => self.streaming = false,
             Action::Save => self.saved_revision = self.revision,
-            Action::Query => {}
+            Action::Query | Action::RegisterRead(_) | Action::RegisterWrite(_, _) => {}
         }
     }
     pub fn fault(&mut self, error: u32) {
@@ -401,17 +591,42 @@ impl Receiver {
         p[56] = self.chip_status;
         p[57] = self.configured as u8;
         p[58..60].copy_from_slice(&self.rssi.to_le_bytes());
+        p[60..62].copy_from_slice(&s.tx_relay_delay_ms.to_le_bytes());
+        p[62] = u8::from(s.tx_enabled);
+        p[63] = s.tx_threshold_dbfs as u8;
         p[64..76].fill(0xff);
         p[80..88].copy_from_slice(&(s.center() as u64).to_le_bytes());
         p[88..92].copy_from_slice(&s.offset.to_le_bytes());
         p[92] = s.mode.digit() - b'0';
+        p[93] = s.tx_drive_ma;
         p[94..96].copy_from_slice(&s.low.to_le_bytes());
         p[116..118].copy_from_slice(&s.high.to_le_bytes());
         p[118] = s.reference as u8;
         p[119] = s.gpio;
-        p[120] = 0xe0;
+        p[120] = 0xe0
+            | FEATURE_FACTORY_RESET
+            | FEATURE_TX_RELAY_DELAY
+            | FEATURE_COMBINED_SETTINGS
+            | FEATURE_IQ_COMPENSATION
+            | FEATURE_IQ_CALIBRATE_NOW;
         p[121] = s.vfo_sign as u8;
         p[122] = s.if_frequency as u8;
+        p[123] = u8::from(s.running_iq) | (u8::from(s.iq_on_large_retune) << 1);
+        p[124] = self.iq_cal_status;
+        p[125] = s.tx_key_ms;
+        p[126] = s.tx_unkey_ms;
+        p[127] = 1
+            | (u8::from(self.tx_active) << 1)
+            | FEATURE_RX_TUNING_ERROR
+            | FEATURE_TX_DRIVE
+            | FEATURE_TX_SLEW
+            | if s.tx_slew_fast { TX_SLEW_FAST } else { 0 }
+            | FEATURE_TX_OUTPUTS
+            | if s.tx_differential {
+                0
+            } else {
+                TX_OUTPUTS_IN_PHASE
+            };
         p
     }
     pub fn cat_prepare(&self, command: Command) -> Result<Option<(Settings, Action)>, Status> {
@@ -455,6 +670,20 @@ impl Receiver {
             return reply(raw, status, &[]);
         }
         match raw[5] {
+            TX_RELAY_DELAY if raw[12..14] == [0, 0] => {
+                reply(raw, status, &self.settings.tx_relay_delay_ms.to_le_bytes())
+            }
+            TX_DRIVE if raw[12..14] == [0, 0] => reply(raw, status, &[self.settings.tx_drive_ma]),
+            TX_SLEW if raw[12..14] == [0, 0] => {
+                reply(raw, status, &[u8::from(self.settings.tx_slew_fast)])
+            }
+            TX_OUTPUTS if raw[12..14] == [0, 0] => {
+                reply(raw, status, &[u8::from(!self.settings.tx_differential)])
+            }
+            RX_TUNING_ERROR => match self.rx_tuning_error() {
+                Ok(value) => reply(raw, status, &value.to_le_bytes()),
+                Err(status) => reply(raw, status, &[]),
+            },
             v2::VERSION_GET | v2::INFO => reply(raw, status, b"Astra918 0.1.0;control=1;stream=1"),
             v2::CAPS => {
                 let mut p = v2::capabilities();
@@ -462,11 +691,24 @@ impl Receiver {
                 p[16..20].copy_from_slice(&1u32.to_le_bytes());
                 p[24..28].fill(0);
                 p[32..36].copy_from_slice(&RATE.to_le_bytes());
-                p[31] &= !16;
                 reply(raw, status, &p)
             }
             _ => reply(raw, status, &self.encode()),
         }
+    }
+    pub fn rx_tuning_error(&self) -> Result<i64, Status> {
+        if !self.configured || self.tx_active {
+            return Err(Status::Busy);
+        }
+        let pll_error = crate::rx_pll::error_micro_hz(
+            self.settings.hardware().frequency,
+            self.settings
+                .vfo_sign
+                .lo_below(self.settings.hardware().frequency),
+            self.settings.if_frequency.hz(),
+        )
+        .map_err(|_| Status::Argument)?;
+        Ok(pll_error + crate::dsp::channel_error_micro_hz(self.settings.offset))
     }
     pub fn iq_header(&self, sequence: u32, first: u64) -> [u8; IQ_HEADER] {
         let mut b = [0; IQ_HEADER];
@@ -514,7 +756,309 @@ pub fn request(cmd: u8, seq: u32, payload: &[u8]) -> [u8; SIZE] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn iq_and_tx_configuration_coexist_and_iq_operations_reject_active_tx() {
+        let mut r = Receiver::default();
+        let (s, action) = r.prepare(IQ_COMPENSATION_SET, &[3, 2]).unwrap();
+        r.commit(s, action);
+        let (s, action) = r.prepare(TX_CONFIG, &[0, (-52i8) as u8, 17, 83]).unwrap();
+        r.commit(s, action);
+        let p = r.encode();
+        assert_eq!(p[123], 2);
+        assert_eq!(&p[62..64], &[0, (-52i8) as u8]);
+        assert_eq!(&p[125..127], &[17, 83]);
+        assert!(!r.settings.running_iq && r.settings.iq_on_large_retune);
+        r.tx_active = true;
+        assert_eq!(r.prepare(IQ_COMPENSATION_SET, &[3, 0]), Err(Status::Busy));
+        assert_eq!(r.prepare(IQ_CALIBRATE_NOW, &[]), Err(Status::Busy));
+    }
+    #[test]
+    fn relay_delay_is_independent_volatile_and_reported() {
+        use super::*;
+        let mut r = Receiver::default();
+        let original = r.settings;
+        assert_eq!(original.tx_relay_delay_ms, 50);
+        for ms in [0u16, 50, 1000] {
+            let (s, action) = r.prepare(TX_RELAY_DELAY, &ms.to_le_bytes()).unwrap();
+            assert_eq!(action, Action::Logical);
+            r.commit(s, action);
+            assert_eq!(
+                r.settings,
+                Settings {
+                    tx_relay_delay_ms: ms,
+                    ..original
+                }
+            );
+            assert_eq!(r.saved_revision, u32::MAX);
+            assert_eq!(&r.encode()[60..62], &ms.to_le_bytes());
+            assert_ne!(r.encode()[120] & FEATURE_TX_RELAY_DELAY, 0);
+            let reply = r.response(&request(TX_RELAY_DELAY, 1, &[]), Status::Ok);
+            assert_eq!(&reply[12..14], &2u16.to_le_bytes());
+            assert_eq!(&reply[16..18], &ms.to_le_bytes());
+            let (s, _) = r.prepare(TX_CONFIG, &[1, (-40i8) as u8, 20, 80]).unwrap();
+            assert_eq!(s.tx_relay_delay_ms, ms);
+        }
+        assert_eq!(r.prepare(TX_RELAY_DELAY, &[0]), Err(Status::Length));
+        assert_eq!(r.prepare(TX_RELAY_DELAY, &[0, 0, 0]), Err(Status::Length));
+        assert_eq!(
+            r.prepare(TX_RELAY_DELAY, &1001u16.to_le_bytes()),
+            Err(Status::Argument)
+        );
+        assert_eq!(r.prepare(TX_RELAY_DELAY, &[]).unwrap().1, Action::Query);
+        let (s, _) = r.prepare(FACTORY_RESET, &[]).unwrap();
+        assert_eq!(s.tx_relay_delay_ms, 50);
+    }
+    #[test]
+    fn tx_output_mode_query_set_and_factory_defaults() {
+        use super::*;
+        let mut radio = Receiver {
+            tx_active: true,
+            configured: true,
+            streaming: true,
+            ..Default::default()
+        };
+        let original = radio.settings;
+        assert!(original.tx_differential);
+        for mode in [1, 0, 1] {
+            let (settings, action) = radio.prepare(TX_OUTPUTS, &[mode]).unwrap();
+            assert_eq!(action, Action::Logical);
+            radio.commit(settings, action);
+            assert_eq!(
+                radio.settings,
+                Settings {
+                    tx_differential: mode == 0,
+                    ..original
+                }
+            );
+            assert!(radio.tx_active && radio.configured && radio.streaming);
+            assert_eq!(radio.generation, 0);
+            assert_eq!(radio.saved_revision, u32::MAX);
+            assert_eq!(radio.prepare(TX_OUTPUTS, &[]).unwrap().1, Action::Query);
+            let query = request(TX_OUTPUTS, 1, &[]);
+            assert_eq!(
+                parse(&radio.response(&query, Status::Ok)).unwrap().1,
+                &[mode]
+            );
+            let status = radio.encode();
+            assert_ne!(status[127] & FEATURE_TX_OUTPUTS, 0);
+            assert_eq!(status[127] & TX_OUTPUTS_IN_PHASE != 0, mode == 1);
+            let setter = request(TX_OUTPUTS, 2, &[mode]);
+            assert_eq!(
+                parse(&radio.response(&setter, Status::Ok)).unwrap().1.len(),
+                STATE_SIZE
+            );
+        }
+        assert_eq!(radio.prepare(TX_OUTPUTS, &[2]), Err(Status::Argument));
+        assert_eq!(radio.prepare(TX_OUTPUTS, &[255]), Err(Status::Argument));
+        assert_eq!(radio.prepare(TX_OUTPUTS, &[0, 1]), Err(Status::Length));
+        radio.tx_active = false;
+        let (settings, action) = radio.prepare(FACTORY_RESET, &[]).unwrap();
+        assert!(settings.tx_differential);
+        radio.commit(settings, action);
+        assert!(radio.settings.tx_differential);
+    }
+    #[test]
+    fn slew_and_drive_are_independent_live_settings_with_explicit_save() {
+        use super::*;
+        let mut radio = Receiver {
+            tx_active: true,
+            streaming: true,
+            ..Default::default()
+        };
+        let initial = radio.settings;
+        for fast in [false, true] {
+            let (settings, action) = radio.prepare(TX_SLEW, &[u8::from(fast)]).unwrap();
+            assert_eq!(action, Action::Logical);
+            radio.commit(settings, action);
+            let (settings, action) = radio.prepare(TX_DRIVE, &[12]).unwrap();
+            radio.commit(settings, action);
+            assert_eq!(
+                radio.settings,
+                Settings {
+                    tx_drive_ma: 12,
+                    tx_slew_fast: fast,
+                    ..initial
+                }
+            );
+            assert!(radio.tx_active && radio.streaming);
+            assert_eq!(radio.generation, 0);
+            assert_eq!(radio.saved_revision, u32::MAX);
+            let query = request(TX_SLEW, 1, &[]);
+            assert_eq!(radio.prepare(TX_SLEW, &[]).unwrap().1, Action::Query);
+            assert_eq!(
+                parse(&radio.response(&query, Status::Ok)).unwrap().1,
+                &[u8::from(fast)]
+            );
+            let status = radio.encode();
+            assert_ne!(status[127] & FEATURE_TX_SLEW, 0);
+            assert_eq!(status[127] & TX_SLEW_FAST != 0, fast);
+            let setter = request(TX_SLEW, 2, &[u8::from(fast)]);
+            assert_eq!(
+                parse(&radio.response(&setter, Status::Ok)).unwrap().1.len(),
+                STATE_SIZE
+            );
+        }
+        assert_eq!(radio.prepare(TX_SLEW, &[2]), Err(Status::Argument));
+        assert_eq!(radio.prepare(TX_SLEW, &[0, 1]), Err(Status::Length));
+        radio.tx_active = false;
+        let (settings, action) = radio.prepare(SAVE, &[]).unwrap();
+        radio.commit(settings, action);
+        assert_eq!(radio.saved_revision, radio.revision);
+    }
+    #[test]
+    fn shared_tx_drive_command_is_validated_live_and_never_saves_implicitly() {
+        use super::*;
+        let mut radio = Receiver {
+            configured: true,
+            streaming: true,
+            tx_active: true,
+            ..Default::default()
+        };
+        let initial = radio.settings;
+        for ma in [2, 4, 8, 12] {
+            let (settings, action) = radio.prepare(TX_DRIVE, &[ma]).unwrap();
+            assert_eq!(action, Action::Logical);
+            radio.commit(settings, action);
+            assert_eq!(
+                radio.settings,
+                Settings {
+                    tx_drive_ma: ma,
+                    ..initial
+                }
+            );
+            assert!(radio.tx_active && radio.streaming);
+            assert_eq!(radio.generation, 0);
+            assert_eq!(radio.saved_revision, u32::MAX);
+            let query = request(TX_DRIVE, 1, &[]);
+            assert_eq!(parse(&radio.response(&query, Status::Ok)).unwrap().1, &[ma]);
+            assert_eq!(radio.encode()[93], ma);
+            assert_ne!(radio.encode()[127] & FEATURE_TX_DRIVE, 0);
+            let setter = request(TX_DRIVE, 2, &[ma]);
+            assert_eq!(
+                parse(&radio.response(&setter, Status::Ok)).unwrap().1.len(),
+                STATE_SIZE
+            );
+        }
+        for ma in [0, 1, 3, 5, 16, 255] {
+            assert_eq!(radio.prepare(TX_DRIVE, &[ma]), Err(Status::Argument));
+        }
+        assert_eq!(radio.prepare(TX_DRIVE, &[4, 4]), Err(Status::Length));
+    }
+    #[test]
+    fn tuning_error_command_reports_signed_microhertz_and_invalid_rx_state() {
+        use super::*;
+        let mut r = Receiver {
+            configured: true,
+            ..Receiver::default()
+        };
+        r.settings.vfo_sign = VfoSign::LoAbove;
+        r.settings.dial = 95_904_001;
+        assert_ne!(r.encode()[127] & FEATURE_RX_TUNING_ERROR, 0);
+        assert_eq!(r.prepare(RX_TUNING_ERROR, &[1]), Err(Status::Length));
+        assert_eq!(
+            r.prepare(RX_TUNING_ERROR, &[]),
+            Ok((r.settings, Action::Query))
+        );
+        let request = request(RX_TUNING_ERROR, 9, &[]);
+        for (dial, expected) in [(95_904_000, 0), (95_904_001, 1_358), (95_903_999, -1_358)] {
+            r.settings.dial = dial;
+            let reply = r.response(&request, Status::Ok);
+            let (_, payload) = parse(&reply).unwrap();
+            assert_eq!(payload.len(), 8);
+            assert_eq!(i64::from_le_bytes(payload.try_into().unwrap()), expected);
+        }
+        r.settings.dial = 95_914_001;
+        r.settings.offset = 10_000;
+        assert_eq!(r.rx_tuning_error(), Ok(1_349));
+        r.tx_active = true;
+        assert_eq!(r.response(&request, Status::Ok)[6], Status::Busy as u8);
+        r.tx_active = false;
+        r.configured = false;
+        assert_eq!(r.rx_tuning_error(), Err(Status::Busy));
+        assert_eq!(r.revision, 0);
+        assert_eq!(r.saved_revision, u32::MAX);
+    }
+    #[test]
+    fn factory_reset_restores_defaults_and_rejects_active_transmit() {
+        use super::*;
+        let mut r = Receiver::default();
+        r.settings.tx_enabled = true;
+        r.settings.dial = 28_075_000;
+        r.saved_revision = 0;
+        assert_eq!(r.prepare(FACTORY_RESET, &[1]), Err(Status::Length));
+        r.tx_active = true;
+        assert_eq!(r.prepare(FACTORY_RESET, &[]), Err(Status::Busy));
+        r.tx_active = false;
+        let (settings, action) = r.prepare(FACTORY_RESET, &[]).unwrap();
+        assert_eq!(action, Action::FactoryReset);
+        r.commit(settings, action);
+        assert_eq!(r.settings, Settings::default());
+        assert_eq!(r.saved_revision, u32::MAX);
+        assert!(r.configured);
+        assert_ne!(r.encode()[120] & FEATURE_FACTORY_RESET, 0);
+        assert_eq!(r.encode()[127] & 1, 1);
+    }
+    #[test]
+    fn transmit_configuration_is_explicit_validated_and_reported() {
+        use super::*;
+        let mut receiver = Receiver::default();
+        assert!(receiver.settings.tx_enabled);
+        let (settings, action) = receiver
+            .prepare(TX_CONFIG, &[1, (-42i8) as u8, 12, 110])
+            .unwrap();
+        assert_eq!(action, Action::Logical);
+        receiver.commit(settings, action);
+        assert!(receiver.settings.tx_enabled);
+        assert_eq!(&receiver.encode()[62..64], &[1, (-42i8) as u8]);
+        assert_eq!(&receiver.encode()[125..127], &[12, 110]);
+        assert_eq!(&receiver.encode()[123..125], &[1, 0]);
+        assert_eq!(receiver.saved_revision, u32::MAX);
+        assert!(
+            receiver
+                .prepare(TX_CONFIG, &[2, (-42i8) as u8, 12, 110])
+                .is_err()
+        );
+        assert!(
+            receiver
+                .prepare(TX_CONFIG, &[1, (-61i8) as u8, 12, 110])
+                .is_err()
+        );
+        assert!(receiver.prepare(TX_CONFIG, &[1, 0]).is_err());
+    }
     use super::*;
+
+    #[test]
+    fn raw_register_access_requires_stopped_iq_and_does_not_change_receiver_state() {
+        let mut receiver = Receiver::default();
+        let initial = receiver.settings;
+        assert_eq!(
+            receiver.prepare(v2::REGISTER_READ, &[0x07]),
+            Ok((initial, Action::RegisterRead(0x07)))
+        );
+        assert_eq!(
+            receiver.prepare(v2::REGISTER_WRITE, &[0x07, 0x32]),
+            Ok((initial, Action::RegisterWrite(0x07, 0x32)))
+        );
+        assert_eq!(
+            receiver.prepare(v2::REGISTER_WRITE, &[0x07]),
+            Err(Status::Length)
+        );
+        receiver.commit(initial, Action::Start);
+        assert_eq!(
+            receiver.prepare(v2::REGISTER_READ, &[0x07]),
+            Err(Status::Busy)
+        );
+        assert_eq!(
+            receiver.prepare(v2::REGISTER_WRITE, &[0x07, 0x32]),
+            Err(Status::Busy)
+        );
+        receiver.commit(initial, Action::Stop);
+        receiver.commit(initial, Action::RegisterWrite(0x07, 0x32));
+        assert_eq!(receiver.settings, initial);
+        assert_eq!(receiver.revision, 0);
+        assert_eq!(receiver.saved_revision, u32::MAX);
+    }
+
     #[test]
     fn reference_and_gpio_are_receiver_owned_and_do_not_restart_iq() {
         let mut r = Receiver::default();
@@ -538,11 +1082,85 @@ mod tests {
         r.fault(6);
         r.commit(s, action);
         assert_eq!(r.encode()[118], 1);
-        assert_eq!(r.encode()[120], 0xe0);
+        assert_eq!(r.encode()[120], 0xff);
         assert!(r.configured);
         assert_eq!(r.error, 0);
         assert_eq!(r.generation, generation + 1);
         assert_eq!(r.saved_revision, u32::MAX);
+    }
+
+    #[test]
+    fn iq_settings_are_masked_live_state_and_only_save_commits_flash_revision() {
+        let mut r = Receiver::default();
+        assert_eq!(r.encode()[123], IQ_RUNNING);
+        assert_eq!(r.encode()[124], 0);
+        for invalid in [[4, 0], [1, 2], [0, 1]] {
+            assert_eq!(
+                r.prepare(IQ_COMPENSATION_SET, &invalid),
+                Err(Status::Argument)
+            );
+        }
+        assert_eq!(r.prepare(IQ_COMPENSATION_SET, &[1]), Err(Status::Length));
+        let (settings, action) = r
+            .prepare(
+                IQ_COMPENSATION_SET,
+                &[IQ_RUNNING | IQ_LARGE_RETUNE, IQ_LARGE_RETUNE],
+            )
+            .unwrap();
+        assert_eq!(action, Action::IqSettings);
+        r.commit(settings, action);
+        assert!(!r.settings.running_iq);
+        assert!(r.settings.iq_on_large_retune);
+        assert_eq!(r.encode()[123], IQ_LARGE_RETUNE);
+        assert_eq!(r.revision, 1);
+        assert_eq!(r.saved_revision, u32::MAX);
+        r.iq_cal_status = 2;
+        assert_eq!(r.encode()[124], 2);
+        r.commit(settings, Action::Save);
+        assert_eq!(r.saved_revision, 1);
+    }
+
+    #[test]
+    fn factory_reset_restores_defaults_and_marks_flash_empty() {
+        let mut r = Receiver::default();
+        let (changed, action) = r.prepare(GPIO_UPDATE, &[0xff, 0xa5]).unwrap();
+        r.commit(changed, action);
+        r.commit(changed, Action::Save);
+        r.iq_cal_status = 2;
+        r.commit(changed, Action::Start);
+        assert_eq!(r.prepare(FACTORY_RESET, &[1]), Err(Status::Length));
+        let (defaults, action) = r.prepare(FACTORY_RESET, &[]).unwrap();
+        assert_eq!(defaults, Settings::default());
+        assert_eq!(action, Action::FactoryReset);
+        r.commit(defaults, action);
+        assert_eq!(r.settings, Settings::default());
+        assert_eq!(r.saved_revision, u32::MAX);
+        assert_eq!(r.iq_cal_status, 0);
+        assert!(r.configured && r.streaming);
+        assert_eq!(r.encode()[120], 0xff);
+    }
+
+    #[test]
+    fn explicit_iq_calibration_is_one_shot_and_does_not_change_saved_settings() {
+        let mut r = Receiver::default();
+        assert_eq!(r.prepare(IQ_CALIBRATE_NOW, &[]), Err(Status::Io));
+        r.commit(r.settings, Action::Configure);
+        r.commit(r.settings, Action::Save);
+        let old_settings = r.settings;
+        let old_revision = r.revision;
+        let saved_revision = r.saved_revision;
+        let generation = r.generation;
+        assert_eq!(r.prepare(IQ_CALIBRATE_NOW, &[0]), Err(Status::Length));
+        let (settings, action) = r.prepare(IQ_CALIBRATE_NOW, &[]).unwrap();
+        assert_eq!(action, Action::CalibrateNow);
+        r.commit(settings, action);
+        r.iq_cal_status = 2;
+        assert_eq!(r.settings, old_settings);
+        assert_eq!(r.revision, old_revision);
+        assert_eq!(r.saved_revision, saved_revision);
+        assert_eq!(r.generation, generation + 1);
+        assert_eq!(r.encode()[124], 2);
+        assert!(!r.settings.iq_on_large_retune);
     }
 
     #[test]
@@ -616,7 +1234,7 @@ mod tests {
         r.commit(s, a);
         assert_eq!(r.settings.offset, 10_000);
         assert_eq!(r.settings.center(), 7_064_049);
-        assert_eq!(r.settings.hardware().frequency, 7_064_000);
+        assert_eq!(r.settings.hardware().frequency, 7_064_049);
         assert_eq!(
             &r.cat_reply(Command::Frequency(None)).bytes[..14],
             b"FA00007074049;"

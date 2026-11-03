@@ -426,7 +426,7 @@ mod tests {
         let (t, _) = s
             .prepare(FREQUENCY_SET, &70_049u64.to_le_bytes(), false)
             .unwrap();
-        assert_eq!(t.config.frequency, 70_000);
+        assert_eq!(t.config.frequency, 70_049);
         assert_eq!(s.requested, 14_200_000);
         assert_eq!(
             s.prepare(RATE_SET, &480_000u32.to_le_bytes(), false),

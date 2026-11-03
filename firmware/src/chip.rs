@@ -3,7 +3,11 @@
 //! Uses documented defaults rather than replaying captured readbacks/poll counts.
 
 use crate::{Config, Error};
-use crate::{astra::ReferenceClock, controls::Controls};
+use crate::{
+    astra::ReferenceClock,
+    controls::Controls,
+    iq_cal::{self, Context, Correction, Pilot},
+};
 use embedded_hal_async::{delay::DelayNs, i2c::I2c};
 
 pub const ADDRESS: u8 = 0x55;
@@ -18,11 +22,16 @@ const FIR: [i16; 56] = [
 pub struct Chip<I, D> {
     bus: I,
     delay: D,
+    iq: iq_cal::State,
 }
 
 impl<I: I2c, D: DelayNs> Chip<I, D> {
     pub fn new(bus: I, delay: D) -> Self {
-        Self { bus, delay }
+        Self {
+            bus,
+            delay,
+            iq: iq_cal::State::default(),
+        }
     }
 
     /// Caller must stop capture first and bound the entire operation. Retry
@@ -70,12 +79,70 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
     where
         I: crate::recovery::Recover,
     {
+        self.configure_recovering_iq(
+            config, controls, reference, lo_below, if_hz, true, false, false,
+        )
+        .await
+    }
+
+    pub fn iq_cal_status(&self) -> u8 {
+        self.iq.status
+    }
+
+    /// Use the internal pilot once without changing the automatic retune policy.
+    /// The requested carrier is restored before this returns successfully.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn calibrate_iq_now(
+        &mut self,
+        config: Config,
+        controls: Controls,
+        reference: ReferenceClock,
+        lo_below: bool,
+        if_hz: u32,
+        running: bool,
+    ) -> Result<(), Error> {
         config.validate()?;
         controls.validate(config)?;
-        match self
-            .configure_controls_clock_with_if(config, controls, reference, lo_below, if_hz)
+        self.finish_iq(
+            config, controls, reference, lo_below, if_hz, running, true, true,
+        )
+        .await
+    }
+
+    /// The pilot request is optional; its lock/ready failure never rejects a valid RF tune.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn configure_recovering_iq(
+        &mut self,
+        config: Config,
+        controls: Controls,
+        reference: ReferenceClock,
+        lo_below: bool,
+        if_hz: u32,
+        running: bool,
+        pilot_on_retune: bool,
+        force_pilot: bool,
+    ) -> Result<(), Error>
+    where
+        I: crate::recovery::Recover,
+    {
+        config.validate()?;
+        controls.validate(config)?;
+        let attempt = async {
+            self.configure_controls_clock_with_if(config, controls, reference, lo_below, if_hz)
+                .await?;
+            self.finish_iq(
+                config,
+                controls,
+                reference,
+                lo_below,
+                if_hz,
+                running,
+                pilot_on_retune,
+                force_pilot,
+            )
             .await
-        {
+        };
+        match attempt.await {
             Ok(()) => Ok(()),
             Err(error @ (Error::I2c | Error::Timeout | Error::Readback)) => {
                 #[cfg(target_arch = "arm")]
@@ -87,9 +154,26 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
                 let _ = error;
                 self.bus.recover().await.map_err(|_| Error::I2c)?;
                 self.reset().await?;
+                self.iq.disable();
                 let result = self
                     .configure_controls_clock_with_if(config, controls, reference, lo_below, if_hz)
                     .await;
+                let result = match result {
+                    Ok(()) => {
+                        self.finish_iq(
+                            config,
+                            controls,
+                            reference,
+                            lo_below,
+                            if_hz,
+                            running,
+                            pilot_on_retune,
+                            force_pilot,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
                 #[cfg(target_arch = "arm")]
                 defmt::info!(
                     "CMX918 configuration recovery result={}",
@@ -99,6 +183,36 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Keyed TX update: never reset, calibrate, switch routes or touch L/R.
+    /// Validate the locked plan before issuing even the first register write.
+    pub async fn retune_tx(
+        &mut self,
+        millihz: u64,
+        previous: crate::tx_pll::Plan,
+    ) -> Result<crate::tx_pll::Plan, Error> {
+        let next = crate::tx_pll::retune_millihz(millihz, previous)?;
+        for (reg, old, value) in [
+            (0x2b, (previous.n >> 8) as u8, (next.n >> 8) as u8),
+            (0x2c, previous.n as u8, next.n as u8),
+            (
+                0x2d,
+                (previous.fraction >> 16) as u8,
+                (next.fraction >> 16) as u8,
+            ),
+            (
+                0x2e,
+                (previous.fraction >> 8) as u8,
+                (next.fraction >> 8) as u8,
+            ),
+            (0x2f, previous.fraction as u8, next.fraction as u8),
+        ] {
+            if old != value {
+                self.write(reg, value).await?;
+            }
+        }
+        Ok(next)
     }
 
     pub async fn read(&mut self, register: u8) -> Result<u8, Error> {
@@ -180,6 +294,17 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
             config.frequency >= 2_000_000,
             96_000,
         )
+        .await?;
+        self.finish_iq(
+            config,
+            controls,
+            reference,
+            config.frequency >= 2_000_000,
+            96_000,
+            true,
+            false,
+            false,
+        )
         .await
     }
 
@@ -193,6 +318,20 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
     ) -> Result<(), Error> {
         let config = config.validate()?;
         let controls = controls.validate(config)?;
+        let plan = crate::rx_pll::plan(config.frequency, lo_below, if_hz)?;
+        let pll_registers = [
+            (0x2a, 1), // internal VCO, manual L, fractional DSM
+            (0x2b, (plan.n >> 8) as u8),
+            (0x2c, plan.n as u8),
+            (0x2d, (plan.fraction >> 16) as u8),
+            (0x2e, (plan.fraction >> 8) as u8),
+            (0x2f, plan.fraction as u8),
+            (0x30, 0), // R=1 with the 38.4 MHz reference
+            (0x31, (plan.l >> 8) as u8),
+            (0x32, plan.l as u8),
+            (0x33, (plan.l >> 8) as u8), // active L status, read-only
+            (0x34, plan.l as u8),
+        ];
         // Stop capture before entering this routine. Standby quiesces processing
         // even if a pre-existing stream's frame-synchronous mute cannot finish.
         self.write(0x03, 1).await?;
@@ -201,14 +340,16 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
         self.write(0x97, config.xtal_control()).await?;
         self.delay.delay_ms(10).await;
         self.write(0x28, config.output_control(true)).await?;
-        self.write(0x2a, 3).await?; // internal PLL, automatic divider, fractional DSM
-        self.write(0x30, 0).await?; // reference divider /1; known baseline
+        for &(register, value) in &pll_registers[..9] {
+            self.write(register, value).await?;
+        }
         // Reset manual output-clock overrides; choose one frame per sample.
         self.write(0x5a, 0).await?; // documented 20 clocks/channel, 40/frame
         self.write(0x5b, 0x19).await?; // single frame, manual ratio x1
         self.write(0x5c, 0).await?; // no manual master-clock division
         self.update(0xb7, 0x80, 0).await?; // direct SCLK, sample on rising edge
-        self.write(0xb8, 0x64).await?; // documented running I/Q compensation
+        self.write(0xb8, 0x60).await?; // keep running compensation off until PLL locks
+        self.write(0x51, 0x70).await?; // no stale one-shot correction during a retune
         self.write(0xba, 0x0a).await?; // demodulation/DC correction, manual digital gain
         // Digital AGC is bypassed above; restore documented manual defaults.
         for (r, v) in [
@@ -223,6 +364,8 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
         ] {
             self.write(r, v).await?;
         }
+        // Fc carries rounded metadata, IF/sign and RF mixer selection only.
+        // Exact-Hz PLL coefficients above never depend on this 100 Hz field.
         let fc = config.carrier_with(lo_below, if_hz);
         for (i, v) in fc.iter().enumerate() {
             self.write(0x08 + i as u8, *v).await?;
@@ -246,47 +389,10 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
             self.write(0xd8, msb).await?;
             self.write(0xd9, lsb).await?; // LSB commits coefficient, no auto-increment
         }
-        let manual_divider = if config.frequency > 170_000_000 {
-            Some(2u16)
-        } else if config.frequency > 130_000_000 {
-            Some(3u16)
-        } else {
-            None
-        };
-        if let Some(divider) = manual_divider {
-            // Select the requested divider even when this silicon cannot lock
-            // it. The steps keep the VCO near the same operating frequency.
-            let lo = if lo_below {
-                u64::from(
-                    config
-                        .frequency
-                        .checked_sub(if_hz)
-                        .ok_or(Error::Frequency)?,
-                )
-            } else {
-                u64::from(config.frequency) + u64::from(if_hz)
-            };
-            let scaled = (lo * 4 * u64::from(divider) * (1 << 24) + 19_200_000) / 38_400_000;
-            let n = (scaled >> 24) as u16;
-            let f = (scaled & 0x00ff_ffff) as u32;
-            self.write(0x2a, 1).await?; // manual L, fractional DSM
-            for (reg, value) in [
-                (0x2b, (n >> 8) as u8),
-                (0x2c, n as u8),
-                (0x2d, (f >> 16) as u8),
-                (0x2e, (f >> 8) as u8),
-                (0x2f, f as u8),
-                (0x31, 0),
-                (0x32, divider as u8),
-            ] {
-                self.write(reg, value).await?;
-            }
-        }
         self.write(0x03, 3).await?;
-        self.write(0x29, if manual_divider.is_some() { 6 } else { 5 })
-            .await?;
-        // Normal tuning: IF filter and automatic PLL/VCO calibration.
-        // High band: IF filter and VCO sub-band selection for the manual L.
+        // IF filter calibration + VCO sub-band/SAS only. Never request PLL
+        // calculation (bit0), which would replace our exact N/F from Fc.
+        self.write(0x29, 6).await?;
         for attempt in 0..200 {
             if self.read(0x29).await? & 7 == 0 {
                 break;
@@ -308,28 +414,18 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
         if !locked {
             return Err(Error::Timeout);
         }
-        if let Some(expected) = manual_divider {
-            let divider =
-                u16::from(self.read(0x33).await?) << 8 | u16::from(self.read(0x34).await?);
-            if divider != expected {
-                return Err(Error::Timeout);
+        // Check programmed N/F/R/L and active L after SAS, not only lock.
+        for &(register, expected) in &pll_registers {
+            if self.read(register).await? != expected {
+                return Err(Error::Readback);
             }
         }
         // Ported from cmx918audiocat 5e4d7d9 (MIT). DS p.28: writing Fc
         // alone does not execute PLL calculation. Preserve the calibrated PLL.
         let routed_fc = controls.input.routing_carrier_with(config, fc);
         if routed_fc != fc {
-            let mut pll = [0; 11];
-            for (i, value) in pll.iter_mut().enumerate() {
-                *value = self.read(0x2a + i as u8).await?;
-            }
             for (i, value) in routed_fc.iter().enumerate() {
                 self.write(8 + i as u8, *value).await?;
-            }
-            for (i, value) in pll.iter().enumerate() {
-                if self.read(0x2a + i as u8).await? != *value {
-                    return Err(Error::Readback);
-                }
             }
         }
         // UM p.65 $A2: LF/MF bit2, HF bit1, VHF bit0. Explicitly restore AUTO
@@ -362,6 +458,12 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
         self.set_lf_mf_capacitor(controls.lf_mf_capacitor).await?;
         if self.read(0xa2).await? & 7 != input_mask || self.read(0x06).await? & 8 == 0 {
             return Err(Error::Readback);
+        }
+        // Verify again after forced LF/HF routing and all control writes.
+        for &(register, expected) in &pll_registers {
+            if self.read(register).await? != expected {
+                return Err(Error::Readback);
+            }
         }
         for (r, v) in [
             (8, routed_fc[0]),
@@ -403,6 +505,222 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
         }
         #[cfg(target_arch = "arm")]
         defmt::info!("LF/MF capacitor applied code={}", code);
+        Ok(())
+    }
+
+    async fn wait_auto(&mut self, mask: u8, polls: usize) -> Result<bool, Error> {
+        for _ in 0..polls {
+            if self.read(0x29).await? & mask == 0 {
+                return Ok(true);
+            }
+            self.delay.delay_ms(10).await;
+        }
+        Ok(false)
+    }
+
+    async fn write_carrier(
+        &mut self,
+        config: Config,
+        lo_below: bool,
+        if_hz: u32,
+    ) -> Result<(), Error> {
+        for (index, value) in config.carrier_with(lo_below, if_hz).into_iter().enumerate() {
+            self.write(8 + index as u8, value).await?;
+        }
+        let plan = crate::rx_pll::plan(config.frequency, lo_below, if_hz)?;
+        for (reg, value) in [
+            (0x2a, 1),
+            (0x2b, (plan.n >> 8) as u8),
+            (0x2c, plan.n as u8),
+            (0x2d, (plan.fraction >> 16) as u8),
+            (0x2e, (plan.fraction >> 8) as u8),
+            (0x2f, plan.fraction as u8),
+            (0x30, 0),
+            (0x31, (plan.l >> 8) as u8),
+            (0x32, plan.l as u8),
+        ] {
+            self.write(reg, value).await?;
+        }
+        self.write(0x29, 6).await?;
+        if !self.wait_auto(7, 100).await? || self.read(0x06).await? & 8 == 0 {
+            return Err(Error::Timeout);
+        }
+        Ok(())
+    }
+
+    async fn pilot_measure(
+        &mut self,
+        context: Context,
+        pilot: Pilot,
+        config: Config,
+    ) -> Result<Option<Correction>, Error> {
+        if pilot.calibration_center != context.center {
+            self.write_carrier(
+                Config {
+                    frequency: pilot.calibration_center,
+                    ..config
+                },
+                context.lo_below,
+                context.if_hz,
+            )
+            .await?;
+        }
+        // The pilot measurement must not compete with continuous correction.
+        // A one-shot command can arrive while running mode is active.
+        self.write(0xb8, 0x60).await?;
+        self.write(0x51, 0x70).await?;
+        // A previous completed calibration must no longer assert READY;
+        // otherwise an old coefficient pair could be mistaken for this run.
+        let mut cleared = false;
+        for _ in 0..20 {
+            if self.read(0xd4).await? & 2 == 0 {
+                cleared = true;
+                break;
+            }
+            self.delay.delay_ms(10).await;
+        }
+        if !cleared {
+            #[cfg(target_arch = "arm")]
+            defmt::warn!("I/Q pilot: previous READY did not clear");
+            return Ok(None);
+        }
+        self.write(0x9e, 0).await?; // never route pilot onto the pin-8 test output
+        for (reg, value) in [
+            (0x99, (pilot.n >> 8) as u8),
+            (0x9a, pilot.n as u8),
+            (0x9b, (pilot.p >> 8) as u8),
+            (0x9c, pilot.p as u8),
+            (0x9d, 3), // documented 64 mV default; avoid the highest injection gain
+        ] {
+            self.write(reg, value).await?;
+        }
+        self.write(0x03, 5).await?; // IQ calibration mode
+        self.write(
+            0x98,
+            if context.input == crate::controls::RfInput::Lf {
+                3
+            } else {
+                5
+            },
+        )
+        .await?;
+        self.write(0x29, 8).await?; // PILOT_EXE
+        let pilot_done = self.wait_auto(8, 50).await?;
+        let pilot_lock = self.read(0x06).await? & 0x40 != 0;
+        if !pilot_done || !pilot_lock {
+            #[cfg(target_arch = "arm")]
+            defmt::warn!(
+                "I/Q pilot: PLL execute done={} lock={}",
+                pilot_done,
+                pilot_lock
+            );
+            return Ok(None);
+        }
+        // $51 automatic mode + ON starts the digital calibration. On the
+        // connected CMX918, an additional $29 IQ_COMP_EXE write after this
+        // prevents READY from asserting, despite updating coefficient bytes.
+        self.write(0x51, 0x73).await?;
+        let mut ready = false;
+        for _ in 0..200 {
+            if self.read(0xd4).await? & 2 != 0 {
+                ready = true;
+                break;
+            }
+            self.delay.delay_ms(10).await;
+        }
+        if !ready {
+            #[cfg(target_arch = "arm")]
+            defmt::warn!(
+                "I/Q pilot: READY did not assert 03={=u8:#x} 06={=u8:#x} 29={=u8:#x} 51={=u8:#x} 98={=u8:#x} D4={=u8:#x}",
+                self.read(0x03).await.unwrap_or(0xff),
+                self.read(0x06).await.unwrap_or(0xff),
+                self.read(0x29).await.unwrap_or(0xff),
+                self.read(0x51).await.unwrap_or(0xff),
+                self.read(0x98).await.unwrap_or(0xff),
+                self.read(0xd4).await.unwrap_or(0xff)
+            );
+            return Ok(None);
+        }
+        let i = i16::from_be_bytes([self.read(0x56).await?, self.read(0x57).await?]);
+        let q = i16::from_be_bytes([self.read(0x58).await?, self.read(0x59).await?]);
+        #[cfg(target_arch = "arm")]
+        defmt::info!("I/Q pilot: correction ready i={} q={}", i, q);
+        Ok(Some(Correction { i, q }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_iq(
+        &mut self,
+        config: Config,
+        controls: Controls,
+        reference: ReferenceClock,
+        lo_below: bool,
+        if_hz: u32,
+        running: bool,
+        pilot_on_retune: bool,
+        force_pilot: bool,
+    ) -> Result<(), Error> {
+        let context = Context {
+            center: config.frequency,
+            input: controls.input.actual(config.frequency),
+            reference,
+            lo_below,
+            if_hz,
+        };
+        if !pilot_on_retune {
+            self.iq.disable();
+        } else if self.iq.needed(context, true, force_pilot) {
+            let normal_fc = config.carrier_with(lo_below, if_hz);
+            let routed_fc = controls.input.routing_carrier_with(config, normal_fc);
+            // Forced LF/HF routing across 2 MHz rewrites Fc without moving
+            // the calibrated LO. A temporary pilot retune cannot safely
+            // reproduce that routing, so leave this unvalidated case alone.
+            let result = if routed_fc == normal_fc
+                && let Some(pilot) = Pilot::for_context(context)
+            {
+                let measured = self.pilot_measure(context, pilot, config).await;
+                // Always remove the injected signal and restore the requested RF tune.
+                self.write(0x98, 0).await?;
+                self.write(0x03, 3).await?;
+                if pilot.calibration_center != context.center {
+                    self.write_carrier(config, lo_below, if_hz).await?;
+                }
+                match measured {
+                    Ok(result) => result,
+                    // A pilot-only lock failure must not reject the already
+                    // successful requested RF tune. Restoring that tune above
+                    // remains mandatory and still propagates its error.
+                    Err(Error::Timeout) => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            match result {
+                Some(correction) => self.iq.succeed(context, correction),
+                None => self.iq.fail(context),
+            }
+        }
+        if let Some(correction) = self
+            .iq
+            .compatible_correction(context)
+            .filter(|_| pilot_on_retune)
+        {
+            for (reg, value) in [
+                (0x52, correction.i.to_be_bytes()[0]),
+                (0x53, correction.i.to_be_bytes()[1]),
+                (0x54, correction.q.to_be_bytes()[0]),
+                (0x55, correction.q.to_be_bytes()[1]),
+            ] {
+                self.write(reg, value).await?;
+            }
+            // Cached coefficients are in the manual registers. Running
+            // compensation is an independent $B8 control.
+            self.write(0x51, 0x71).await?;
+        } else {
+            self.write(0x51, 0x70).await?;
+        }
+        self.write(0xb8, if running { 0x64 } else { 0x60 }).await?;
         Ok(())
     }
 
@@ -462,11 +780,11 @@ impl<I: I2c, D: DelayNs> Chip<I, D> {
     // operating-margin result. At 2_124_900_000 Hz one of ten reads unlocked;
     // 2_125_000_000 Hz was unlocked throughout.
     //
-    // The normal configuration path and its automatic calibration/SAS
+    // The normal configuration path and its automatic filter calibration/SAS
     // algorithm must remain the production path; do not enable this while
     // streaming. UM918/2.0 pp.58–60: clear PLL_SAS_MD in $95, then select
     // minimum VCO capacitance / band cell 0 in $92. This manually sets PLL L,
-    // R, N and F without writing AUTO_EXE, which would recalculate them. A
+    // R, N and F without writing AUTO_EXE bit0, which would recalculate them. A
     // normal configure_controls() immediately follows any re-run to restore
     // automatic calibration.
     async fn manual_vco_high_edge_experiment(&mut self) -> Result<(), Error> {
@@ -550,6 +868,8 @@ mod tests {
         heal: bool,
         recovery_fails: bool,
         corrupt_read: Option<u8>,
+        corrupt_on_route: Option<u8>,
+        ready_on_iq: bool,
     }
     impl Bus {
         fn new() -> Self {
@@ -562,6 +882,8 @@ mod tests {
                 heal: true,
                 recovery_fails: false,
                 corrupt_read: None,
+                corrupt_on_route: None,
+                ready_on_iq: false,
             };
             b.regs[6] = 8;
             b
@@ -603,13 +925,25 @@ mod tests {
                             self.writes.push((reg as u8, value));
                             if reg == 0x29 && !self.busy {
                                 self.regs[reg] = 0;
+                                if self.regs[0x2a] & 2 == 0 {
+                                    self.regs[0x33] = self.regs[0x31];
+                                    self.regs[0x34] = self.regs[0x32];
+                                }
+                            }
+                            if reg == 0x51 && value & 1 == 0 {
+                                self.regs[0xd4] &= !2;
+                            }
+                            if reg == 0x51 && value == 0x73 && self.ready_on_iq {
+                                self.regs[0xd4] |= 2;
                             }
                             if reg == 0x28 {
                                 self.regs[0x60] = u8::from(value & 8 != 0);
                             }
-                            if reg == 0x32 && self.regs[0x2a] & 2 == 0 {
-                                self.regs[0x33] = self.regs[0x31];
-                                self.regs[0x34] = value;
+                            if reg == 0x0a
+                                && self.regs[0x03] == 3
+                                && let Some(register) = self.corrupt_on_route
+                            {
+                                self.regs[usize::from(register)] ^= 1;
                             }
                             reg += 1;
                         }
@@ -640,6 +974,54 @@ mod tests {
             flags: 2,
         }
     }
+    #[test]
+    fn keyed_tx_retunes_only_write_changed_n_and_f_registers() {
+        futures::executor::block_on(async {
+            let mut chip = Chip::new(Bus::new(), Delay);
+            let mut plan = crate::tx_pll::plan(50_000_000).unwrap();
+            let original = plan;
+            for millihz in [
+                50_000_000_001,
+                50_000_006_250,
+                50_000_020_833,
+                49_000_000_000,
+                50_000_000_000,
+            ] {
+                chip.bus.writes.clear();
+                let old = plan;
+                plan = chip.retune_tx(millihz, plan).await.unwrap();
+                assert_eq!((plan.l, plan.divider), (original.l, original.divider));
+                assert!(
+                    chip.bus
+                        .writes
+                        .iter()
+                        .all(|(reg, _)| (0x2b..=0x2f).contains(reg))
+                );
+                for (reg, before, after) in [
+                    (0x2b, (old.n >> 8) as u8, (plan.n >> 8) as u8),
+                    (0x2c, old.n as u8, plan.n as u8),
+                    (
+                        0x2d,
+                        (old.fraction >> 16) as u8,
+                        (plan.fraction >> 16) as u8,
+                    ),
+                    (0x2e, (old.fraction >> 8) as u8, (plan.fraction >> 8) as u8),
+                    (0x2f, old.fraction as u8, plan.fraction as u8),
+                ] {
+                    assert_eq!(chip.bus.writes.contains(&(reg, after)), before != after);
+                }
+            }
+            chip.bus.writes.clear();
+            assert_eq!(chip.retune_tx(50_000_000_000, plan).await.unwrap(), plan);
+            assert!(chip.bus.writes.is_empty());
+            assert_eq!(
+                chip.retune_tx(60_000_000_000, plan).await,
+                Err(Error::Frequency)
+            );
+            assert!(chip.bus.writes.is_empty());
+        });
+    }
+
     #[test]
     fn capacitor_full_range_reserved_bits_readback_and_errors() {
         futures::executor::block_on(async {
@@ -732,6 +1114,220 @@ mod tests {
         });
     }
     #[test]
+    fn pilot_calibration_restores_exact_hz_pll_coefficients() {
+        futures::executor::block_on(async {
+            let mut bus = Bus::new();
+            bus.regs[6] = 0x48;
+            bus.ready_on_iq = true;
+            let mut chip = Chip::new(bus, Delay);
+            let c = Config {
+                frequency: 14_200_037,
+                ..config()
+            };
+            chip.configure_recovering_iq(
+                c,
+                Controls::default(),
+                ReferenceClock::Internal,
+                true,
+                96_000,
+                true,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+            chip.calibrate_iq_now(
+                c,
+                Controls::default(),
+                ReferenceClock::Internal,
+                true,
+                96_000,
+                true,
+            )
+            .await
+            .unwrap();
+            let plan = crate::rx_pll::plan(c.frequency, true, 96_000).unwrap();
+            assert_eq!(chip.iq_cal_status(), 1);
+            assert_eq!(
+                &chip.bus.regs[0x2b..0x30],
+                &[
+                    (plan.n >> 8) as u8,
+                    plan.n as u8,
+                    (plan.fraction >> 16) as u8,
+                    (plan.fraction >> 8) as u8,
+                    plan.fraction as u8
+                ]
+            );
+            assert_eq!(
+                &chip.bus.regs[0x31..0x33],
+                &[(plan.l >> 8) as u8, plan.l as u8]
+            );
+            assert_eq!(chip.bus.regs[0x98], 0);
+            assert!(!chip.bus.writes.contains(&(0x29, 1)));
+        });
+    }
+    #[test]
+    fn pilot_calibration_restores_requested_tune_and_reuses_coefficients() {
+        futures::executor::block_on(async {
+            let mut bus = Bus::new();
+            bus.regs[6] = 0x48; // Main and pilot PLL locked.
+            bus.ready_on_iq = true; // Digital correction completes on command.
+            bus.regs[0x56..0x5a].copy_from_slice(&[0x12, 0x34, 0xff, 0xed]);
+            let mut chip = Chip::new(bus, Delay);
+            chip.configure_recovering_iq(
+                config(),
+                Controls::default(),
+                ReferenceClock::Internal,
+                true,
+                96_000,
+                false,
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(chip.iq_cal_status(), 1);
+            assert_eq!(chip.bus.regs[0x98], 0); // Pilot powered down.
+            assert_eq!(chip.bus.regs[3], 3); // Normal mode restored.
+            assert_eq!(chip.bus.regs[0xb8], 0x60); // Running mode remains off.
+            assert_eq!(chip.bus.regs[0x51], 0x71); // Saved correction in manual mode.
+            assert_eq!(&chip.bus.regs[0x52..0x56], &[0x12, 0x34, 0xff, 0xed]);
+            assert_eq!(&chip.bus.regs[8..11], &config().carrier());
+            let pilots = chip.bus.writes.iter().filter(|w| **w == (0x29, 8)).count();
+            let small = Config {
+                frequency: 14_300_000,
+                ..config()
+            };
+            chip.configure_recovering_iq(
+                small,
+                Controls::default(),
+                ReferenceClock::Internal,
+                true,
+                96_000,
+                true,
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                chip.bus.writes.iter().filter(|w| **w == (0x29, 8)).count(),
+                pilots
+            );
+            assert_eq!(chip.bus.regs[0xb8], 0x64);
+            assert_eq!(&chip.bus.regs[0x52..0x56], &[0x12, 0x34, 0xff, 0xed]);
+            let large = Config {
+                frequency: 14_700_000,
+                ..config()
+            };
+            chip.configure_recovering_iq(
+                large,
+                Controls::default(),
+                ReferenceClock::Internal,
+                true,
+                96_000,
+                true,
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                chip.bus.writes.iter().filter(|w| **w == (0x29, 8)).count(),
+                pilots + 1
+            );
+        });
+    }
+    #[test]
+    fn manual_pilot_calibration_runs_now_even_with_automatic_retune_disabled() {
+        futures::executor::block_on(async {
+            let mut bus = Bus::new();
+            bus.regs[6] = 0x48;
+            bus.ready_on_iq = true;
+            bus.regs[0x56..0x5a].copy_from_slice(&[0x12, 0x34, 0xff, 0xed]);
+            let mut chip = Chip::new(bus, Delay);
+            chip.configure_recovering_iq(
+                config(),
+                Controls::default(),
+                ReferenceClock::Internal,
+                true,
+                96_000,
+                true,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(chip.iq_cal_status(), 0);
+            for expected_runs in 1..=2 {
+                let write_start = chip.bus.writes.len();
+                chip.calibrate_iq_now(
+                    config(),
+                    Controls::default(),
+                    ReferenceClock::Internal,
+                    true,
+                    96_000,
+                    true,
+                )
+                .await
+                .unwrap();
+                assert_eq!(chip.iq_cal_status(), 1);
+                assert_eq!(chip.bus.regs[0x98], 0);
+                assert_eq!(chip.bus.regs[3], 3);
+                assert_eq!(&chip.bus.regs[8..11], &config().carrier());
+                assert_eq!(chip.bus.regs[0x51], 0x71);
+                assert_eq!(chip.bus.regs[0xb8], 0x64);
+                let writes = &chip.bus.writes[write_start..];
+                let paused = writes
+                    .iter()
+                    .position(|write| *write == (0xb8, 0x60))
+                    .unwrap();
+                let started = writes
+                    .iter()
+                    .position(|write| *write == (0x51, 0x73))
+                    .unwrap();
+                let resumed = writes
+                    .iter()
+                    .rposition(|write| *write == (0xb8, 0x64))
+                    .unwrap();
+                assert!(paused < started && started < resumed);
+                assert!(!writes.contains(&(0x29, 0x10)));
+                assert_eq!(
+                    chip.bus
+                        .writes
+                        .iter()
+                        .filter(|write| **write == (0x29, 8))
+                        .count(),
+                    expected_runs
+                );
+            }
+        });
+    }
+    #[test]
+    fn pilot_lock_failure_is_reported_but_rf_tune_survives() {
+        futures::executor::block_on(async {
+            let mut chip = Chip::new(Bus::new(), Delay);
+            chip.configure_recovering_iq(
+                config(),
+                Controls::default(),
+                ReferenceClock::Internal,
+                true,
+                96_000,
+                true,
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(chip.iq_cal_status(), 2);
+            assert_eq!(&chip.bus.regs[8..11], &config().carrier());
+            assert_eq!(chip.bus.regs[0x98], 0);
+            assert_eq!(chip.bus.regs[3], 3);
+            assert_eq!(chip.bus.regs[0x51], 0x70);
+            assert_eq!(chip.bus.regs[0xb8], 0x64);
+        });
+    }
+    #[test]
     fn reference_selection_preserves_clock_output_bits_and_recovers_after_reset() {
         futures::executor::block_on(async {
             let mut chip = Chip::new(Bus::new(), Delay);
@@ -773,6 +1369,212 @@ mod tests {
                 (u64::from(high.frequency - 96_000) * 8 * (1 << 24) + 19_200_000) / 38_400_000;
             assert_eq!(chip.bus.regs[0x2c], (scaled >> 24) as u8);
             assert_eq!(chip.bus.regs[0x2f], scaled as u8);
+        });
+    }
+    #[test]
+    fn precise_rx_programs_known_coefficients_with_both_if_signs_and_rates() {
+        futures::executor::block_on(async {
+            for (frequency, lo_below, if_hz) in [
+                (96_096_001, true, 96_000),
+                (95_904_001, false, 96_000),
+                (96_120_001, true, 120_000),
+                (95_880_001, false, 120_000),
+            ] {
+                for (bandwidth, rate) in crate::PROFILES
+                    .into_iter()
+                    .chain([(100_000, crate::USB_DECIMATED_RATE)])
+                {
+                    let c = Config {
+                        frequency,
+                        bandwidth,
+                        rate,
+                        ..config()
+                    };
+                    let mut chip = Chip::new(Bus::new(), Delay);
+                    chip.configure_controls_clock_with_if(
+                        c,
+                        Controls::default(),
+                        ReferenceClock::Internal,
+                        lo_below,
+                        if_hz,
+                    )
+                    .await
+                    .unwrap();
+                    // LO=96_000_001 Hz: N=40, F=7, R=1, L=4.
+                    assert_eq!(
+                        &chip.bus.regs[0x2a..=0x34],
+                        &[1, 0, 40, 0, 0, 7, 0, 0, 4, 0, 4]
+                    );
+                    assert_eq!(&chip.bus.regs[8..11], &c.carrier_with(lo_below, if_hz));
+                    let writes = &chip.bus.writes;
+                    assert_eq!(
+                        writes
+                            .iter()
+                            .filter(|(r, _)| *r == 0x29)
+                            .copied()
+                            .collect::<Vec<_>>(),
+                        [(0x29, 6)]
+                    );
+                    assert!(writes.iter().all(|&(r, v)| r != 0x2a || v == 1));
+                    let coefficients = writes.iter().position(|&v| v == (0x2f, 7)).unwrap();
+                    let calibration = writes.iter().position(|&v| v == (0x29, 6)).unwrap();
+                    assert!(coefficients < calibration);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn precise_rx_low_band_writes_and_checks_upper_l_bits() {
+        futures::executor::block_on(async {
+            let mut chip = Chip::new(Bus::new(), Delay);
+            let c = Config {
+                frequency: 70_001,
+                flags: config().flags | crate::EXPERIMENTAL_RF,
+                ..config()
+            };
+            chip.configure_controls_clock_with_if(
+                c,
+                Controls::default(),
+                ReferenceClock::Internal,
+                false,
+                120_000,
+            )
+            .await
+            .unwrap();
+            let plan = crate::rx_pll::plan(c.frequency, false, 120_000).unwrap();
+            assert!(plan.l > 255);
+            assert_eq!(chip.bus.regs[0x31], (plan.l >> 8) as u8);
+            assert_eq!(chip.bus.regs[0x32], plan.l as u8);
+            assert_eq!(&chip.bus.regs[0x31..0x33], &chip.bus.regs[0x33..0x35]);
+            assert!(
+                !chip
+                    .bus
+                    .writes
+                    .iter()
+                    .any(|(r, _)| [0x33, 0x34].contains(r))
+            );
+        });
+    }
+
+    #[test]
+    fn precise_rx_rejects_invalid_lo_and_if_before_chip_io() {
+        futures::executor::block_on(async {
+            for (frequency, lo_below, if_hz, expected) in [
+                (70_000, false, 96_000, Error::Frequency),
+                (96_000, true, 96_000, Error::Frequency),
+                (120_000, true, 120_000, Error::Frequency),
+                (70_000, true, 120_000, Error::Frequency),
+                (14_200_037, true, 96_001, Error::Profile),
+                (14_200_037, false, 0, Error::Profile),
+            ] {
+                let mut chip = Chip::new(Bus::new(), Delay);
+                let result = chip
+                    .configure_recovering_clock_with_if(
+                        Config {
+                            frequency,
+                            flags: config().flags | crate::EXPERIMENTAL_RF,
+                            ..config()
+                        },
+                        Controls::default(),
+                        ReferenceClock::Internal,
+                        lo_below,
+                        if_hz,
+                    )
+                    .await;
+                assert_eq!(result, Err(expected));
+                assert!(chip.bus.writes.is_empty());
+                assert_eq!(chip.bus.recoveries, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn precise_rx_checks_all_pll_registers_and_active_l_after_calibration() {
+        futures::executor::block_on(async {
+            for register in 0x2a..=0x34 {
+                let mut bus = Bus::new();
+                bus.corrupt_read = Some(register);
+                let mut chip = Chip::new(bus, Delay);
+                assert_eq!(chip.configure(config()).await, Err(Error::Readback));
+                assert!(chip.bus.writes.contains(&(0x29, 6)));
+            }
+        });
+    }
+
+    #[test]
+    fn precise_rx_forced_lf_and_hf_routing_preserve_exact_pll_and_detect_corruption() {
+        futures::executor::block_on(async {
+            for (frequency, input) in [
+                (474_237, crate::controls::RfInput::Hf),
+                (14_200_037, crate::controls::RfInput::Lf),
+            ] {
+                for lo_below in [false, true] {
+                    for if_hz in [96_000, 120_000] {
+                        let c = Config {
+                            frequency,
+                            ..config()
+                        };
+                        let controls = Controls {
+                            input,
+                            ..Default::default()
+                        };
+                        let mut chip = Chip::new(Bus::new(), Delay);
+                        chip.configure_controls_clock_with_if(
+                            c,
+                            controls,
+                            ReferenceClock::Internal,
+                            lo_below,
+                            if_hz,
+                        )
+                        .await
+                        .unwrap();
+                        let plan = crate::rx_pll::plan(frequency, lo_below, if_hz).unwrap();
+                        let n = u16::from_be_bytes([chip.bus.regs[0x2b], chip.bus.regs[0x2c]]);
+                        let fraction = u32::from_be_bytes([
+                            0,
+                            chip.bus.regs[0x2d],
+                            chip.bus.regs[0x2e],
+                            chip.bus.regs[0x2f],
+                        ]);
+                        assert_eq!((n, fraction), (plan.n, plan.fraction));
+                        let fc = c.carrier_with(lo_below, if_hz);
+                        let routed = input.routing_carrier_with(c, fc);
+                        assert_ne!(fc, routed);
+                        assert_eq!(&chip.bus.regs[8..11], &routed);
+                        assert_eq!(chip.bus.regs[0xa2] & 7, input.mask(frequency));
+                        let writes = &chip.bus.writes;
+                        let calibration = writes.iter().position(|&v| v == (0x29, 6)).unwrap();
+                        assert_eq!(
+                            writes[calibration + 1..calibration + 4],
+                            [(8, routed[0]), (9, routed[1]), (10, routed[2]),]
+                        );
+                        assert!(
+                            writes[calibration + 1..]
+                                .iter()
+                                .all(|&(r, _)| { !(0x29..=0x34).contains(&r) })
+                        );
+                        // Corruption occurs only during the post-calibration Fc
+                        // route write, so the final verification must catch it.
+                        for register in 0x2a..=0x34 {
+                            let mut bus = Bus::new();
+                            bus.corrupt_on_route = Some(register);
+                            let mut chip = Chip::new(bus, Delay);
+                            assert_eq!(
+                                chip.configure_controls_clock_with_if(
+                                    c,
+                                    controls,
+                                    ReferenceClock::Internal,
+                                    lo_below,
+                                    if_hz,
+                                )
+                                .await,
+                                Err(Error::Readback)
+                            );
+                        }
+                    }
+                }
+            }
         });
     }
     #[test]
@@ -869,7 +1671,7 @@ mod tests {
             );
             assert_eq!(chip.bus.recoveries, 1);
             assert_eq!(
-                chip.bus.writes.iter().filter(|w| **w == (0x29, 5)).count(),
+                chip.bus.writes.iter().filter(|w| **w == (0x29, 6)).count(),
                 2
             );
             chip.bus.heal = true;
@@ -949,7 +1751,7 @@ mod tests {
             .unwrap();
             assert_eq!(chip.bus.regs[0xa2] & 7, 2);
             let w = &chip.bus.writes;
-            let cal = w.iter().position(|v| *v == (0x29, 5)).unwrap();
+            let cal = w.iter().position(|v| *v == (0x29, 6)).unwrap();
             let route = w
                 .windows(3)
                 .position(|v| v == [(8, 0), (9, 0x4e), (10, 0x20)])

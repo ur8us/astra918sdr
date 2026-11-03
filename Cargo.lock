@@ -104,6 +104,7 @@ dependencies = [
  "futures",
  "libm",
  "pio",
+ "rp-pac",
  "static_cell",
 ]
 

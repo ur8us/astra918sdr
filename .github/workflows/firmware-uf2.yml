@@ -18,27 +18,21 @@ jobs:
           echo "878a1a1e7d8336b8be60300c7218f366d9790c0d3a211b181d6d172e80b1248e  $RUNNER_TEMP/picotool.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/picotool.tar.gz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/picotool" >> "$GITHUB_PATH"
-      - name: Build RP2350A UF2
-        run: python3 scripts/build_firmware.py --variant rp235xa
-      - name: Build RP2350B UF2
-        run: python3 scripts/build_firmware.py --variant rp235xb
-      - name: Upload both UF2 files
+      - name: Build Raspberry Pi Pico 2 UF2
+        run: python3 scripts/build_firmware.py --board rpipico2
+      - name: Upload Raspberry Pi Pico 2 UF2
         uses: actions/upload-artifact@v4
         with:
-          name: astra918-rp2350a-and-rp2350b-uf2
-          path: |
-            artifacts/rp235xa/astra918.uf2
-            artifacts/rp235xb/astra918.uf2
+          name: astra918-rpipico2-uf2
+          path: artifacts/astra918-rpipico2.uf2
           if-no-files-found: error
       - name: Publish tagged release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cp artifacts/rp235xa/astra918.uf2 astra918-rp235xa.uf2
-          cp artifacts/rp235xb/astra918.uf2 astra918-rp235xb.uf2
           gh release create "$GITHUB_REF_NAME" \
-            astra918-rp235xa.uf2 astra918-rp235xb.uf2 \
+            artifacts/astra918-rpipico2.uf2 \
             --verify-tag \
             --title "Astra918 firmware $GITHUB_REF_NAME" \
-            --notes "RP2350A and RP2350B UF2 images built from this tag. These images assume a 12 MHz MCU crystal and 4 MiB flash; confirm the board variant before flashing."
+            --notes "Raspberry Pi Pico 2 firmware built from this tag for RP2350A with a 12 MHz MCU crystal and 4 MiB flash."

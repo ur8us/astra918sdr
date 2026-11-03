@@ -127,11 +127,12 @@ impl Controls {
         Ok(self)
     }
 }
+/// Legacy API name: validate and retain whole Hz without RX quantization.
 pub fn round_frequency(hz: u64) -> Result<u32, Error> {
     if !(u64::from(EXPERIMENTAL_MIN_HZ)..=u64::from(EXPERIMENTAL_MAX_HZ)).contains(&hz) {
         return Err(Error::Frequency);
     }
-    Ok(((hz + 50) / 100 * 100) as u32)
+    Ok(hz as u32)
 }
 pub const FIR2_DEFAULT: [i16; 40] = [
     28, 44, 54, 38, -11, -82, -146, -163, -107, 16, 157, 244, 211, 43, -201, -402, -435, -236, 142,
@@ -154,8 +155,8 @@ mod tests {
     use super::*;
     #[test]
     fn tuning_and_routes() {
-        assert_eq!(round_frequency(70_049), Ok(70_000));
-        assert_eq!(round_frequency(70_050), Ok(70_100));
+        assert_eq!(round_frequency(70_049), Ok(70_049));
+        assert_eq!(round_frequency(70_050), Ok(70_050));
         assert!(round_frequency(u64::MAX).is_err());
         for (hz, input) in [
             (70_000, RfInput::Lf),
