@@ -1,7 +1,7 @@
 # CMX918 register investigation
 
-These notes record differences between CML's published CMX918 documentation and
-its evaluation software, checked on 2026-10-07, plus a later user oscilloscope
+These notes record differences between published CMX918 documentation and
+the evaluation software, checked on 2026-10-07, plus a later user oscilloscope
 observation. They are research findings, not a replacement register specification.
 
 **A field present in software is not proof that it works on every silicon
@@ -13,9 +13,9 @@ evaluation-software comparison did not involve undocumented register writes.
 
 | Reference | Source | Use |
 |---|---|---|
-| DS | [CMX918 datasheet V2.0](https://cmlmicro.com/wp-content/uploads/2026/06/CMX918_DS_V2.0.pdf), local file `CMX918_DS_V2.0.pdf` | Current pin assignments and interface description |
+| DS | Local `CMX918_DS_V2.0.pdf` | Current pin assignments and interface description |
 | UM | User-supplied `CMX918_UM_V2.0.pdf`, UM918/2.0 | Detailed register definitions; page numbers below are printed page numbers |
-| ES | [CML ES9180 version 1.0 evaluation software](https://cmlmicro.com/wp-content/uploads/2026/08/ES9180v1_0.zip), linked from the [CMX918 product page](https://cmlmicro.com/products/rf-building-blocks/product/cmx918-low-power-software-defined-radio-sdr-tuner/) | Register and field tables bundled in `ES9180.exe` |
+| ES | `ES9180v1_0.zip` evaluation software, installer `ES9180InstallerV1p0.exe` | Register and field tables bundled in `ES9180.exe` |
 | HW | Read-only access through Astra918's register helper scripts | Observations on one connected receiver, not reset-value or electrical characterization |
 | Scope | User's oscilloscope measurement during an earlier pilot-output scan | Pilot output observed on pin 8 in scan state 5 |
 
@@ -26,7 +26,7 @@ below.
 
 The ES installer archive was unpacked. Its `registers` and `fields` table modules
 were evaluated with inert constructor replacements, restricted builtins and an
-import hook allowing only those replacements. The CML GUI and hardware-interface
+import hook allowing only those replacements. The evaluation GUI and hardware-interface
 code were not run, and instructions were not disassembled. The comparison covered
 140 named register entries and 226 named field entries, checking apparent name
 differences against the manual's bit diagrams and prose.
@@ -103,7 +103,7 @@ register map and the examined ES9180 field definitions provide no named
 L-divider test-output control. `$2A` bit 1 selects the L-divider's automatic
 versus manual ratio source; `$31`–`$32` hold its ratio. None of those documented
 fields enables a test output. Avoid assigning an address or bit to
-`L_DIV_SW_EN` without new manufacturer information or a controlled pin
+`L_DIV_SW_EN` without further register documentation or a controlled pin
 measurement.
 
 ### Reserved PLL-bit readback scan on the connected receiver
@@ -135,7 +135,7 @@ cannot be excluded from readback alone. The scan does **not** identify an
 ### Unused-register search for main-PLL test switches
 
 The synthesizer block diagram shows `VCO_OUT_SW_EN`, `L_DIV_SW_EN` and
-`ADC_CLOCK_SW_EN` alongside the three pilot switches. The [ES9180](https://cmlmicro.com/wp-content/uploads/2026/08/ES9180v1_0.zip)
+`ADC_CLOCK_SW_EN` alongside the three pilot switches. The ES9180
 field table contains only the three `PILOT_*_SW_EN` names at `$9E` bits 2–0;
 it does not assign addresses or masks to the other diagram labels. The diagram
 shows internal signals, not a register map or a guaranteed path to pin 8.
@@ -304,4 +304,4 @@ streaming. A failed read is not evidence that a register is absent.
 No flash Save, reset or firmware change is needed to inspect these registers.
 The pilot settings above describe a user-reported measurement; the other
 undocumented controls still have no verified write sequence. Further pin
-measurements or a CML definition would clarify their behavior.
+measurements or additional register definitions would clarify their behavior.
