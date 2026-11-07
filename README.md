@@ -1,5 +1,8 @@
 # Astra918 transceiver
 
+Astra918 is the general name for a family of receiver and transceiver hardware
+versions built around the CMX918 chip.
+
 CMX918 + RP2350 (Raspberry Pi Pico 2) SDR transceiver firmware with wideband
 I/Q reception and audio-driven single-tone FSK transmission for applications
 such as WSJT-X. One USB connection exposes 12 kHz mono recording and playback,
