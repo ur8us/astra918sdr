@@ -20,6 +20,14 @@ struct MockDriver {
     next_in: usize,
     next_out: usize,
 }
+
+#[test]
+fn host_timer_driver_wakes_descriptor_test_executor() {
+    let before = embassy_time::Instant::now();
+    futures::executor::block_on(embassy_time::Timer::after_millis(1));
+    assert!(before.elapsed() >= embassy_time::Duration::from_millis(1));
+}
+
 struct Ep(EndpointInfo);
 impl Endpoint for Ep {
     fn info(&self) -> &EndpointInfo {

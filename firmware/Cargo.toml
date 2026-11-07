@@ -44,3 +44,7 @@ rp-pac = { version = "=7.0.0", features = ["rp235x"] }
 embassy-usb = { version = "=0.6.0", default-features = false, features = ["max-interface-count-7"] }
 futures = { version = "0.3", features = ["executor"] }
 critical-section = { version = "1.2", features = ["std"] }
+
+[target.'cfg(not(target_arch = "arm"))'.dev-dependencies]
+# USB descriptor tests link Embassy timers even when no device is running.
+embassy-time = { version = "=0.5.1", features = ["std", "generic-queue-8"] }
