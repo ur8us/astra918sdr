@@ -203,7 +203,9 @@ python3 scripts/build_firmware.py
 python3 scripts/build_firmware.py --board rpipico2
 ```
 
-The build produces `artifacts/astra918-rpipico2.uf2`. The ELF and a manifest
+The build produces `artifacts/astra918-rpipico2-i2c.uf2`. This firmware is for
+connecting the CMX918 to Raspberry Pi Pico 2 via the I²C control interface.
+The ELF and a manifest
 recording hashes, source revision and tree state are in `artifacts/rpipico2/`.
 The Pico 2 configuration uses a 12 MHz MCU crystal and 4 MiB flash, reserving
 the final 8 KiB for settings. CMX918 RESETN is wired to GP2 and firmware drives
@@ -211,13 +213,13 @@ it actively low during reset and high afterward.
 The CAT USB serial interface also enters RP2350 BOOTSEL when the host sets its
 line coding to 1200 baud. On Linux, for example, run
 `stty -F /dev/ttyACM0 1200`, wait for the RP2350 boot device to appear, then
-`picotool load -v artifacts/astra918-rpipico2.uf2`.
+`picotool load -v artifacts/astra918-rpipico2-i2c.uf2`.
 This does not write settings or implement picotool's `-f` reset interface.
 Close programs using the CAT port before changing its baud rate; CAT software
 configured for 1200 baud would trigger BOOTSEL as well.
 
 Download tagged firmware from [GitHub Releases](https://github.com/ur8us/astra918sdr/releases):
-`astra918-rpipico2.uf2` for Raspberry Pi Pico 2. The board profile selects
+`astra918-rpipico2-i2c.uf2` for Raspberry Pi Pico 2 with CMX918 control via I²C. The board profile selects
 RP2350A. Additional profiles belong in the build script's `BOARDS` table and
 must match their linker, clock and pin configuration.
 Pushing a `v*` tag builds and publishes this file. Other builds remain

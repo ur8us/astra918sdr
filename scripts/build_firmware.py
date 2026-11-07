@@ -13,6 +13,8 @@ import subprocess
 BOARDS = {
     "rpipico2": {
         "variant": "rp235xa",
+        # CMX918 control connection to Raspberry Pi Pico 2 uses I2C.
+        "control_interface": "i2c",
         "flash_bytes": 4 * 1024 * 1024,
         "mcu_crystal_hz": 12_000_000,
     },
@@ -31,7 +33,7 @@ def main():
     directory = root / "artifacts" / args.board
     directory.mkdir(parents=True, exist_ok=True)
     elf = directory / "astra918.elf"
-    uf2 = root / "artifacts" / f"astra918-{args.board}.uf2"
+    uf2 = root / "artifacts" / f"astra918-{args.board}-{board['control_interface']}.uf2"
     shutil.copy2(root / "target/thumbv8m.main-none-eabihf/release/astra918", elf)
     subprocess.run(["picotool", "uf2", "convert", str(elf), str(uf2)], check=True)
     subprocess.run(["picotool", "info", "-a", str(elf)], check=True)
