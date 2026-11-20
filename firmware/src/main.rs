@@ -7,6 +7,7 @@ compile_error!("Select only one RP2350 variant");
 mod capture;
 mod i2c_bus;
 mod tx_counter;
+#[cfg_attr(feature = "board-lionel", path = "tx_disabled.rs")]
 mod tx_output;
 use tx_output::{tx_divider_disable, tx_divider_enable};
 mod usb_audio;
@@ -15,6 +16,7 @@ use astra918_firmware::{
     Error,
     astra::{self as a, Action, Receiver, Settings},
     audio::{AudioQueue, MAX_PACKET_BYTES},
+    board,
     cat::{Command, Mode, Parser, Reply},
     chip::Chip,
     dsp::Demodulator,
@@ -37,9 +39,8 @@ use embassy_rp::{
     bind_interrupts,
     flash::{Blocking, Flash},
     gpio::{Level, Output},
-    i2c,
     multicore::{Stack, spawn_core1},
-    peripherals::{FLASH, I2C0, USB},
+    peripherals::{FLASH, USB},
     usb,
 };
 use embassy_sync::{
@@ -58,7 +59,6 @@ use static_cell::StaticCell;
 defmt::timestamp!("{=u64:us}", Instant::now().as_micros());
 bind_interrupts!(pub struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
-    I2C0_IRQ => i2c::InterruptHandler<I2C0>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
 });
 type UsbDriver = usb::Driver<'static, USB>;
@@ -66,25 +66,27 @@ type In = usb::Endpoint<'static, USB, usb::In>;
 type Out = usb::Endpoint<'static, USB, usb::Out>;
 type Storage = Flash<'static, FLASH, Blocking, { nv::FLASH_SIZE }>;
 
-async fn key_tx_relay(ptt: &mut Output<'_>, led: &mut Output<'_>, ms: u16) {
+async fn key_tx_relay<'a>(ptt: &mut Option<Output<'a>>, led: &mut Option<Output<'a>>, ms: u16) {
     astra918_firmware::tx_relay::key(&mut embassy_time::Delay, ms, |on| {
-        ptt.set_level(if on { Level::High } else { Level::Low });
-        led.set_level(if on { Level::High } else { Level::Low });
+        for pin in [ptt.as_mut(), led.as_mut()].into_iter().flatten() {
+            pin.set_level(if on { Level::High } else { Level::Low });
+        }
     })
     .await;
 }
 
-async fn unkey_tx_relay(ptt: &mut Output<'_>, led: &mut Output<'_>, ms: u16) {
+async fn unkey_tx_relay<'a>(ptt: &mut Option<Output<'a>>, led: &mut Option<Output<'a>>, ms: u16) {
     TX_MONITOR_AUDIO_KEYED.store(false, Ordering::Release);
-    let keyed = ptt.is_set_high();
+    let keyed = ptt.as_ref().is_some_and(Output::is_set_high);
     astra918_firmware::tx_relay::unkey(
         &mut embassy_time::Delay,
         ms,
         keyed,
         || unsafe { tx_divider_disable() },
         |on| {
-            ptt.set_level(if on { Level::High } else { Level::Low });
-            led.set_level(if on { Level::High } else { Level::Low });
+            for pin in [ptt.as_mut(), led.as_mut()].into_iter().flatten() {
+                pin.set_level(if on { Level::High } else { Level::Low });
+            }
         },
     )
     .await;
@@ -104,7 +106,7 @@ async fn cmx_reset_task(mut resetn: Output<'static>) {
             Timer::after_millis(20).await;
             resetn.set_high();
             CMX_RESET_COUNT.fetch_add(1, Ordering::Release);
-            defmt::info!("CMX918 RESETN pulsed via GP2");
+            defmt::info!("CMX918 RESETN pulsed via GP{}", board::RESETN);
         }
         Timer::after_millis(10).await;
     }
@@ -992,9 +994,16 @@ async fn apply(
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     // Drive CMX918 RESETN actively low during reset and high afterward.
+    #[cfg(not(feature = "board-lionel"))]
     let cmx_resetn = Output::new(p.PIN_2, Level::High);
-    let mut ptt = Output::new(p.PIN_6, Level::Low);
-    let mut tx_led = Output::new(p.PIN_25, Level::Low);
+    #[cfg(feature = "board-lionel")]
+    let cmx_resetn = Output::new(p.PIN_43, Level::High);
+    #[cfg(not(feature = "board-lionel"))]
+    let mut ptt = Some(Output::new(p.PIN_6, Level::Low));
+    #[cfg(not(feature = "board-lionel"))]
+    let mut tx_led = Some(Output::new(p.PIN_25, Level::Low));
+    #[cfg(feature = "board-lionel")]
+    let (mut ptt, mut tx_led) = (None, None);
     // GP21 must stay low throughout RX, including immediately after boot.
     unsafe { tx_divider_disable() };
     defmt::info!("Astra918 0.1.0; composite USB; development firmware");
@@ -1018,6 +1027,10 @@ async fn main(spawner: Spawner) {
         radio.settings = s;
         radio.saved_revision = 0;
         save_seq = seq;
+    }
+    if !board::TX_SUPPORTED {
+        radio.settings.tx_enabled = false;
+        radio.settings.tx_iq_monitor = false;
     }
     let mut info = [0u32; 4];
     // SAFETY: correctly sized writable ROM information buffer, requesting chip identity only.
@@ -1073,17 +1086,21 @@ async fn main(spawner: Spawner) {
     spawner.spawn(cmx_reset_task(cmx_resetn).unwrap());
     static STACK: StaticCell<Stack<65536>> = StaticCell::new();
     static EXECUTOR: StaticCell<Executor> = StaticCell::new();
+    #[cfg(not(feature = "board-lionel"))]
     let capture = capture::Capture::new(p.PIO0, p.DMA_CH0, p.PIN_8, p.PIN_9, p.PIN_10, Irqs);
+    #[cfg(feature = "board-lionel")]
+    let capture = capture::Capture::new(p.PIO0, p.DMA_CH0, p.PIN_44, p.PIN_45, p.PIN_46, Irqs);
     spawn_core1(p.CORE1, STACK.init(Stack::new()), move || {
         EXECUTOR.init(Executor::new()).run(|spawner| {
             spawner.spawn(engine_task(capture).unwrap());
             spawner.spawn(monitor_task().unwrap());
         });
     });
-    let mut chip = Chip::new(
-        i2c_bus::Bus::new(p.I2C0, p.PIN_1, p.PIN_0),
-        embassy_time::Delay,
-    );
+    #[cfg(not(feature = "board-lionel"))]
+    let control_bus = i2c_bus::Bus::new(p.I2C0, p.PIN_1, p.PIN_0);
+    #[cfg(feature = "board-lionel")]
+    let control_bus = i2c_bus::Bus::new(p.I2C1, p.PIN_7, p.PIN_6);
+    let mut chip = Chip::new(control_bus, embassy_time::Delay);
     let settings = radio.settings;
     let startup = async {
         // Coefficient preparation is a one-time core-1 workload. Complete it
@@ -1180,7 +1197,7 @@ async fn main(spawner: Spawner) {
         let mut should_transmit = tx_plan.is_some();
         for _ in 0..elapsed_ms {
             should_transmit = vox.tick(
-                radio.settings.tx_enabled && !manual_tx && !manual_rx_hold,
+                board::TX_SUPPORTED && radio.settings.tx_enabled && !manual_tx && !manual_rx_hold,
                 tx_measurement,
                 radio.settings.tx_threshold_dbfs,
                 radio.settings.tx_key_ms,
@@ -1200,7 +1217,9 @@ async fn main(spawner: Spawner) {
             let Some(tone) = measurement.frequency_hz else {
                 continue;
             };
-            ptt.set_low();
+            if let Some(ptt) = ptt.as_mut() {
+                ptt.set_low();
+            }
             publish_iq_state(&radio);
             TX_ACTIVE.store(true, Ordering::Release);
             if let Err(error) = engine(Engine::Pause).await {
@@ -1335,6 +1354,12 @@ async fn main(spawner: Spawner) {
             Either::First(raw) => {
                 radio.tx_active = TX_ACTIVE.load(Ordering::Acquire);
                 if let Ok((cmd, payload)) = a::parse(&raw) {
+                    if !board::TX_SUPPORTED && matches!(cmd, a::TX_CARRIER | a::TX_MEASURE) {
+                        REPLIES
+                            .send(a::reply(&raw, a::Status::Unsupported, &[]))
+                            .await;
+                        continue;
+                    }
                     if cmd == a::RX_TUNING_ERROR && manual_tx {
                         REPLIES.send(a::reply(&raw, a::Status::Busy, &[])).await;
                         continue;

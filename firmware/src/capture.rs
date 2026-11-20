@@ -1,9 +1,10 @@
-//! SPI slave implemented in PIO on the required GP8/9/10 wiring.
+//! SPI slave implemented in PIO on the selected board's I/Q pins.
 //! DMA0 runs continuously into an aligned ring; no per-sample CPU interrupts.
 //! PIO0/SM0 and DMA0 are owned exclusively by this object for its full lifetime.
 
+use astra918_firmware::board::{IqClock, IqData, IqFrame};
 use astra918_firmware::{
-    Error, RingCursor,
+    Error, RingCursor, board,
     protocol::{BLOCK_BYTES, SAMPLES},
 };
 use core::{
@@ -13,7 +14,7 @@ use core::{
 };
 use embassy_rp::{
     Peri, pac,
-    peripherals::{DMA_CH0, PIN_8, PIN_9, PIN_10, PIO0},
+    peripherals::{DMA_CH0, PIO0},
     pio,
 };
 use embassy_time::Instant;
@@ -45,9 +46,9 @@ impl Capture {
     pub fn new(
         pio: Peri<'static, PIO0>,
         dma: Peri<'static, DMA_CH0>,
-        rx: Peri<'static, PIN_8>,
-        cs: Peri<'static, PIN_9>,
-        clk: Peri<'static, PIN_10>,
+        rx: Peri<'static, IqData>,
+        cs: Peri<'static, IqFrame>,
+        clk: Peri<'static, IqClock>,
         irqs: crate::Irqs,
     ) -> Self {
         let pio::Pio {
@@ -64,7 +65,7 @@ impl Capture {
         // Synchronizers stay enabled. At max selected 9.6 MHz SCLK there are
         // ~15.6 system cycles/bit at 150 MHz; worst bit loop is seven instructions
         // plus external-edge waits. Electrical timing still requires validation.
-        let program = ::pio::pio_asm!(
+        let mut program = ::pio::pio_asm!(
             "wait 1 gpio 9",
             ".wrap_target",
             "frame:",
@@ -86,11 +87,27 @@ impl Capture {
             "wait 1 gpio 9",
             ".wrap",
         );
+        // WAIT GPIO operands and JMP PIN are relative to PIO GPIOBASE.
+        // Embassy selects base 16 for Lionel's GP44..46 from the IN mapping.
+        for instruction in &mut program.program.code {
+            if *instruction & 0xe000 == 0x2000 {
+                let pin = if *instruction & 0x1f == 9 {
+                    board::IQ_FRAME
+                } else {
+                    board::IQ_CLOCK
+                };
+                *instruction = (*instruction & !0x1f) | u16::from(pin - board::PIO_GPIO_BASE);
+            }
+        }
         let loaded = common.load_program(&program.program);
         let mut config = pio::Config::default();
         config.use_program(&loaded, &[]);
         config.set_in_pins(&[&rx]);
         config.set_jmp_pin(&cs);
+        let mut exec = config.get_exec();
+        exec.jmp_pin = board::IQ_FRAME - board::PIO_GPIO_BASE;
+        // SAFETY: only the board-relative JMP PIN operand changes.
+        unsafe { config.set_exec(exec) };
         config.shift_in = pio::ShiftConfig {
             auto_fill: false,
             threshold: 32,

@@ -18,6 +18,13 @@ BOARDS = {
         "flash_bytes": 4 * 1024 * 1024,
         "mcu_crystal_hz": 12_000_000,
     },
+    "lionel": {
+        "variant": "rp235xb",
+        "features": ["board-lionel"],
+        "control_interface": "i2c",
+        "flash_bytes": 16 * 1024 * 1024,
+        "mcu_crystal_hz": 12_000_000,
+    },
 }
 
 
@@ -27,9 +34,10 @@ def main():
     args = parser.parse_args()
     board = BOARDS[args.board]
     root = Path(__file__).resolve().parents[1]
+    features = ["device", board["variant"], *board.get("features", [])]
     subprocess.run(["cargo", "build", "--locked", "-p", "astra918-firmware", "--bin", "astra918",
                     "--release", "--target", "thumbv8m.main-none-eabihf", "--features",
-                    f"device,{board['variant']}"], cwd=root, check=True)
+                    ",".join(features)], cwd=root, check=True)
     directory = root / "artifacts" / args.board
     directory.mkdir(parents=True, exist_ok=True)
     elf = directory / "astra918.elf"

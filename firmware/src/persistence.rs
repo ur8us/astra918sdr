@@ -6,7 +6,7 @@ use crate::{
 };
 pub const SECTOR: usize = 4096;
 pub const PAGE: usize = 256;
-pub const FLASH_SIZE: usize = 4 * 1024 * 1024;
+pub const FLASH_SIZE: usize = crate::board::FLASH_BYTES;
 pub const BASE: u32 = (FLASH_SIZE - 2 * SECTOR) as u32;
 pub fn crc32(data: &[u8]) -> u32 {
     let mut c = !0u32;
@@ -27,7 +27,7 @@ pub fn record(settings: Settings, sequence: u32) -> [u8; PAGE] {
         settings,
         ..Receiver::default()
     };
-    b[16..16 + STATE_SIZE].copy_from_slice(&r.encode());
+    b[16..16 + STATE_SIZE].copy_from_slice(&r.encode_settings());
     let crc = crc32(&b[..252]);
     b[252..].copy_from_slice(&crc.to_le_bytes());
     b
@@ -79,7 +79,7 @@ pub fn decode(b: &[u8; PAGE], commit: &[u8; PAGE]) -> Option<(Settings, u32)> {
             lf_attenuator: p[79],
         },
         reference: if version == 1 {
-            ReferenceClock::Internal
+            Settings::default().reference
         } else {
             ReferenceClock::parse(p[118]).ok()?
         },

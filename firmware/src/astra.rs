@@ -167,11 +167,15 @@ impl Default for Settings {
             low: 100,
             high: 3500,
             controls: Controls::default(),
-            reference: ReferenceClock::Internal,
+            reference: if crate::board::LIONEL {
+                ReferenceClock::External
+            } else {
+                ReferenceClock::Internal
+            },
             gpio: 0,
             vfo_sign: VfoSign::Auto,
             if_frequency: IfFrequency::Auto,
-            tx_enabled: true,
+            tx_enabled: crate::board::TX_SUPPORTED,
             tx_threshold_dbfs: -40,
             tx_key_ms: 10,
             tx_unkey_ms: 100,
@@ -310,6 +314,21 @@ impl Default for Receiver {
 }
 impl Receiver {
     pub fn prepare(&self, cmd: u8, p: &[u8]) -> Result<(Settings, Action), Status> {
+        if !crate::board::TX_SUPPORTED
+            && matches!(
+                cmd,
+                TX_CONFIG
+                    | TX_DRIVE
+                    | TX_SLEW
+                    | TX_OUTPUTS
+                    | TX_RELAY_DELAY
+                    | TX_IQ_MONITOR
+                    | TX_CARRIER
+                    | TX_MEASURE
+            )
+        {
+            return Err(Status::Unsupported);
+        }
         if self.tx_active && matches!(cmd, IQ_COMPENSATION_SET | IQ_CALIBRATE_NOW) {
             return Err(Status::Busy);
         }
@@ -580,6 +599,17 @@ impl Receiver {
         self.capture_faults = self.capture_faults.saturating_add(1);
     }
     pub fn encode(&self) -> [u8; STATE_SIZE] {
+        let mut p = self.encode_settings();
+        if !crate::board::TX_SUPPORTED {
+            p[62] = 0;
+            p[64..76].fill(0xff);
+            p[120] &= !FEATURE_TX_RELAY_DELAY;
+            p[127] &= FEATURE_RX_TUNING_ERROR;
+        }
+        p
+    }
+    /// Flash records retain their schema independently of board capabilities.
+    pub(crate) fn encode_settings(&self) -> [u8; STATE_SIZE] {
         let s = self.settings;
         let mut p = [0; STATE_SIZE];
         p[..80].copy_from_slice(

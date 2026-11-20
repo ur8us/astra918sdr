@@ -9,6 +9,7 @@ default = []
 device = []
 rp235xa = ["embassy-rp/rp235xa"]
 rp235xb = ["embassy-rp/rp235xb"]
+board-lionel = ["rp235xb"]
 
 [[bin]]
 name = "astra918"

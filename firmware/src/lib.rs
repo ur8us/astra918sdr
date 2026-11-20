@@ -2,6 +2,7 @@
 
 pub mod astra;
 pub mod audio;
+pub mod board;
 pub mod cat;
 pub mod chip;
 pub mod control_v2;
