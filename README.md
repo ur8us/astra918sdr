@@ -231,7 +231,7 @@ available as a ZIP artifact of the **Firmware UF2** workflow in GitHub Actions.
 ### Lionel hardware
 
 Build with `python3 scripts/build_firmware.py --board lionel` to produce
-`artifacts/astra918-lionel-i2c.uf2` for Lionel's board paired with the Waveshare
+`artifacts/astra918-lionel-i2c.uf2` for [Lionel's board](https://github.com/ur8us/cmx918-lionel) paired with the Waveshare
 RP2350-Touch-LCD-3.49 (RP2350B, 16 MiB flash). It uses GP6/GP7 for I²C SDA/SCL,
 GP44/GP45/GP46 for I/Q data/frame/clock, and GP43 for CMX918 RESETN, following
 the [Lionel wiring table](https://www.eevblog.com/forum/rf-microwave/astra918-cmx918rp2350-based-receiver-0-07-to-130-mhz/msg6368579/#msg6368579).
