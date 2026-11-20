@@ -31,7 +31,7 @@ jobs:
             artifacts/astra918-lionel-i2c.uf2
           if-no-files-found: error
       - name: Publish tagged release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
